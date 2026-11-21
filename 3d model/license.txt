@@ -1,0 +1,8 @@
+Model Information:
+* title:	non-military consumer UAV drone
+* source:	https://sketchfab.com/3d-models/non-military-consumer-uav-drone-7558fc3a77d4412dad2a02d9d7c3fbb7
+* author:	FamousUnityHubSoldier (https://sketchfab.com/FamousUnityHubSoldier)
+
+Model License:
+* license type:	SKETCHFAB Standard (https://sketchfab.com/licenses)
+* requirements:	Under basic restrictions, use worldwide, on all types of media, commercially or not, and in all types of derivative works

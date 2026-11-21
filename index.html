@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-Hant-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>長洲飛行隊｜香港巡航</title>
+<link rel="stylesheet" href="style.css?v=r6-20261121-2335">
+<script>
+window.GAME_BUILD = 'r6-20261121-2335';
+window.GAME_DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
+if (!window.GAME_DEBUG) document.documentElement.classList.add('release');
+document.addEventListener('DOMContentLoaded', function() {
+  var stamp = document.getElementById('build-id');
+  if (stamp && window.GAME_DEBUG) stamp.hidden = false;
+});
+window.__diag = function(info) {
+  try {
+    var payload = {
+      build: window.GAME_BUILD,
+      type: info && info.type || 'diag',
+      stage: info && info.stage || '',
+      message: String(info && (info.message || info) || ''),
+      source: info && info.source || '',
+      line: info && info.line,
+      col: info && info.col
+    };
+    // Only the local debug server has /__diag/error. On GitHub Pages or file://
+    // this must be a no-op so the browser does not spam 404s.
+    var host = location.hostname;
+    var isLocalHttp = (host === '127.0.0.1' || host === 'localhost' || host === '[::1]') && location.protocol !== 'file:';
+    if (isLocalHttp) {
+      fetch('__diag/error', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).catch(function() {});
+    }
+    var stamp = document.getElementById('build-id');
+    if (stamp && payload.message) {
+      stamp.dataset.error = payload.stage ? (payload.stage + ': ' + payload.message) : payload.message;
+      stamp.hidden = false;
+      var label = payload.stage || payload.type || '';
+      var shortMsg = payload.message ? String(payload.message).replace(/\s+/g, ' ').slice(0, 90) : '';
+      stamp.textContent = '版本 ' + window.GAME_BUILD + (label ? ' · ' + label : '') + (shortMsg ? ' — ' + shortMsg : '');
+    }
+  } catch (ignore) {}
+};
+window.addEventListener('error', function(ev) {
+  window.__diag({
+    type: 'onerror',
+    message: ev.message,
+    source: ev.filename,
+    line: ev.lineno,
+    col: ev.colno
+  });
+});
+window.addEventListener('unhandledrejection', function(ev) {
+  var reason = ev.reason;
+  window.__diag({
+    type: 'unhandledrejection',
+    message: reason && (reason.message || reason)
+  });
+});
+</script>
+<script defer src="terrain.js?v=r6-20261121-2335"></script>
+<script defer src="local-heights.js?v=r6-20261121-2335"></script>
+<script defer src="imagery.js?v=r6-20261121-2335"></script>
+<script defer src="drone-model.js?v=r6-20261121-2335"></script>
+<script defer src="hk-map.js?v=r6-20261121-2335"></script>
+<script defer src="game.js?v=r6-20261121-2335"></script>
+</head>
+<body>
+<main>
+<canvas id="world" aria-label="長洲三維飛行畫面"></canvas>
+<header>
+  <div class="brand">長洲飛行隊 <small>HONG KONG AIR SURVEY</small></div>
+  <div class="header-tools">
+    <div id="build-id" title="版本識別" hidden>版本 r6-20261121-2335</div>
+    <label class="place-label">出發點 <select id="place"></select></label>
+    <button id="camera" disabled>切換視角 <kbd>C</kbd></button>
+  </div>
+</header>
+<section class="mission"><small>離島巡航</small><h1 id="target">長洲碼頭</h1><p id="guide" aria-live="polite">準備起飛</p><p id="mission-note" hidden>自由飛行中。長洲巡航任務只在碼頭出發後進行。</p><ol id="route"></ol></section>
+<div id="marker" hidden></div>
+<div id="reticle" hidden>＋</div>
+<aside class="map"><canvas id="map" width="180" height="160" aria-label="航線小地圖"></canvas><small id="map-status">北 ↑　載入全港地圖…</small></aside>
+<section class="telemetry" aria-label="飛行儀表">
+<div><small>海拔</small><strong id="height">0</strong> m</div><div><small>離地</small><strong id="agl">200</strong> m</div><div><small>地速</small><strong id="speed">0</strong> km/h</div><div><small>航向</small><strong id="heading">000</strong> °</div><div><small>電量</small><strong id="battery">100</strong> %</div>
+</section>
+<div class="keyboard">WASD 平移　 Q / E 轉向　 Space / Shift 升降　 R 重飛</div>
+<div class="touch" aria-label="觸控飛行">
+<div class="pad"><button data-key="KeyW">前</button><button data-key="KeyA">左</button><button data-key="KeyS">後</button><button data-key="KeyD">右</button></div>
+<div class="pad"><button data-key="Space">升</button><button data-key="ShiftLeft">降</button><button data-key="KeyQ">左轉</button><button data-key="KeyE">右轉</button></div>
+</div>
+<div class="overlay" id="overlay">
+<section class="brief">
+<small>CHEUNG CHAU · HONG KONG</small>
+<h2 id="title">離島巡航</h2>
+<p id="briefing">全程最低離地高度為 200 米，方便觀看航拍地貌。由長洲碼頭出發可進行離島巡航任務；也可選其他出發點自由飛行。全港地圖需網絡載入地政總署航拍圖及公開高程圖磚；圖磚未到也可先開始，失敗時會改用長洲離線地圖並在畫面標示。</p>
+<p id="start-hint" class="controls">任務與自由飛行都從離地 200 米開始，不能再降低。長洲任務改為飛入巡查圈，回航時在綠圈降至最低離地高度並停定。其他出發點沒有全港任務。</p>
+<p class="controls">電腦可用 WASD 平移、Q / E 轉向、空白鍵升高、Shift 下降。手機請用畫面上的飛行按鈕。</p>
+<div class="brief-actions">
+<button id="start" disabled>載入畫面…</button>
+<button id="explore" class="secondary" disabled>自由飛行</button>
+</div>
+</section>
+</div>
+<footer>
+<img id="landsd-logo" alt="地政總署" src="https://www.landsd.gov.hk/images/landsd_logo.svg" width="120" height="36">
+<div>
+Aerial Photograph from Lands Department　航拍影像 © 香港特別行政區政府地政總署<br>
+全港高程：<a href="https://registry.opendata.aws/terrain-tiles/">Mapzen Terrain Tiles</a>（香港地區為 SRTM／GMTED，courtesy of the U.S. Geological Survey；<a href="https://github.com/tilezen/joerd/blob/master/docs/attribution.md">完整來源</a>）　長洲精細高程：<a href="https://data.gov.hk/en-data/dataset/hk-landsd-openmap-5m-grid-dtm">地政總署 5 米 DTM</a><br>
+無人機模型：<a href="https://sketchfab.com/3d-models/non-military-consumer-uav-drone-7558fc3a77d4412dad2a02d9d7c3fbb7">non-military consumer UAV drone</a> by FamousUnityHubSoldier，Sketchfab Standard License
+</div>
+</footer>
+</main>
+</body>
+</html>
