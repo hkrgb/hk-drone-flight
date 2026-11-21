@@ -91,6 +91,42 @@ const HK = (() => {
     return list;
   }
 
+  // Every horizontal point belongs to exactly ONE surface. A polygon offset
+  // cannot make intersecting DEM meshes into a valid LOD system.
+  function planSurfaceTiles(available, mode = 'partition') {
+    const bases = available.filter(t => t.z === BASE_Z);
+    const fine = available.filter(t => t.z === IMAGE_Z);
+    if (mode === 'base') return bases.map(t => ({ ...t, photo: t }));
+    if (mode === 'fine') return fine.map(t => ({ ...t, photo: t }));
+    // Diagnostic only: reproduce r8's overlapping ownership, not the default.
+    if (mode === 'legacy') return [...bases, ...fine].map(t => ({ ...t, photo: t }));
+    const fineKeys = new Set(fine.map(t => `${t.x}/${t.y}`));
+    const ancestors = new Set();
+    for (const t of fine) {
+      for (let z = BASE_Z; z < IMAGE_Z; z++) {
+        const scale = 2 ** (IMAGE_Z - z);
+        ancestors.add(`${z}/${Math.floor(t.x / scale)}/${Math.floor(t.y / scale)}`);
+      }
+    }
+    const result = [];
+    function visit(z, x, y, photo) {
+      if (z === IMAGE_Z && fineKeys.has(`${x}/${y}`)) {
+        result.push({ z, x, y, photo: { z, x, y } });
+      } else if (ancestors.has(`${z}/${x}/${y}`)) {
+        for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++)
+          visit(z + 1, x * 2 + dx, y * 2 + dy, photo);
+      } else result.push({ z, x, y, photo });
+    }
+    const baseKeys = new Set(bases.map(t => `${t.x}/${t.y}`));
+    for (const t of bases) visit(t.z, t.x, t.y, t);
+    for (const t of fine) {
+      const scale = 2 ** (IMAGE_Z - BASE_Z);
+      if (!baseKeys.has(`${Math.floor(t.x / scale)}/${Math.floor(t.y / scale)}`))
+        result.push({ ...t, photo: t });
+    }
+    return result;
+  }
+
   function fillTemplate(tmpl, z, x, y) {
     return tmpl.replace('{z}', z).replace('{x}', x).replace('{y}', y);
   }
@@ -153,9 +189,10 @@ const HK = (() => {
       varying ${vary} float depth;
       uniform sampler2D photo;
       uniform float hasPhoto;
+      uniform vec4 photoTransform;
       uniform vec3 fallbackColour;
       void main() {
-        vec3 colour = hasPhoto > 0.5 ? texture2D(photo, vUv).rgb : fallbackColour;
+        vec3 colour = hasPhoto > 0.5 ? texture2D(photo, vUv * photoTransform.xy + photoTransform.zw).rgb : fallbackColour;
         float haze = min(0.55, 1.0-exp(-max(0.0,depth)*0.00008));
         gl_FragColor = vec4(mix(colour, vec3(0.69,0.84,0.81), haze), 1.0);
       }`));
@@ -164,26 +201,12 @@ const HK = (() => {
     return program;
   }
 
-  function sampleHeightGrid(grid, u, v) {
-    const c = Math.max(0, Math.min(grid.width - 1.001, u * (grid.width - 1)));
-    const r = Math.max(0, Math.min(grid.height - 1.001, v * (grid.height - 1)));
-    const x0 = Math.floor(c), y0 = Math.floor(r);
-    const tx = c - x0, ty = r - y0;
-    const x1 = Math.min(grid.width - 1, x0 + 1);
-    const y1 = Math.min(grid.height - 1, y0 + 1);
-    const h00 = grid.heights[y0 * grid.width + x0];
-    const h10 = grid.heights[y0 * grid.width + x1];
-    const h01 = grid.heights[y1 * grid.width + x0];
-    const h11 = grid.heights[y1 * grid.width + x1];
-    return (h00 * (1 - tx) + h10 * tx) * (1 - ty) + (h01 * (1 - tx) + h11 * tx) * ty;
-  }
-
   function createTileManager(gl, elevationFn) {
     const vary = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT)?.precision
       ? 'highp' : 'mediump';
     const program = createProgram(gl, vary);
     const uniforms = Object.fromEntries(
-      ['eye', 'rightAxis', 'upAxis', 'forwardAxis', 'lens', 'photo', 'hasPhoto', 'fallbackColour']
+      ['eye', 'rightAxis', 'upAxis', 'forwardAxis', 'lens', 'photo', 'hasPhoto', 'fallbackColour', 'photoTransform']
         .map(name => [name, gl.getUniformLocation(program, name)])
     );
     const aPos = gl.getAttribLocation(program, 'position');
@@ -194,6 +217,12 @@ const HK = (() => {
     const meshes = new Map();
     const queue = [];
     const queued = new Set();
+    const query = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+    const layerMode = ['base', 'fine', 'legacy'].includes(query.get('mapLayers')) ? query.get('mapLayers') : 'partition';
+    const flatDebug = query.get('mapHeight') === 'flat';
+    const hideSkirts = query.get('hideSkirts') === '1';
+    let lastDrawStats = { patches: 0, topTriangles: 0, skirtTriangles: 0, missingPhotos: 0 };
+    let surfacePlan = [], planDirty = true, terrainRevision = 0;
     let inflight = 0, failed = 0, loadedImages = 0, loadedTerrain = 0, lastBase = false;
     const status = { mode: 'loading', message: '正在載入全港地圖…', failed: 0 };
     if (typeof location !== 'undefined' && location.protocol === 'file:') {
@@ -203,6 +232,7 @@ const HK = (() => {
 
     function rememberImage(key, image) {
       images.set(key, image);
+      planDirty = true;
       const texture = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
@@ -214,18 +244,44 @@ const HK = (() => {
       textures.set(key, texture);
     }
 
-    function heightAt(lat, lon, x, z) {
-      const local = elevationFn ? elevationFn(x, z) : null;
-      if (local != null) return Math.max(0, local);
-      const tx = lon2tile(lon, TERRAIN_Z);
-      const ty = lat2tile(lat, TERRAIN_Z);
-      const key = tileKey('ter', TERRAIN_Z, Math.floor(tx), Math.floor(ty));
-      const grid = terrains.get(key);
-      if (!grid) return 0;
-      return Math.max(0, sampleHeightGrid(grid, tx - Math.floor(tx), ty - Math.floor(ty)));
+    function sampleTerrarium(lat, lon) {
+      const tx = lon2tile(lon, TERRAIN_Z), ty = lat2tile(lat, TERRAIN_Z);
+      const ix = Math.floor(tx), iy = Math.floor(ty);
+      const grid = terrains.get(tileKey('ter', TERRAIN_Z, ix, iy));
+      if (!grid) return null;
+      // Terrarium samples are pixel centres, not vertices spanning [0,1].
+      // Interpolate in one global pixel lattice and read adjacent DEM tiles.
+      const px = tx * grid.width - 0.5, py = ty * grid.height - 0.5;
+      const x0 = Math.floor(px), y0 = Math.floor(py);
+      const fx = px - x0, fy = py - y0;
+      function pixel(x, y) {
+        const gx = Math.floor(x / grid.width), gy = Math.floor(y / grid.height);
+        const neighbor = terrains.get(tileKey('ter', TERRAIN_Z, gx, gy));
+        if (neighbor) return neighbor.heights[(y - gy * grid.height) * neighbor.width + x - gx * grid.width];
+        const cx = Math.max(0, Math.min(grid.width - 1, x - ix * grid.width));
+        const cy = Math.max(0, Math.min(grid.height - 1, y - iy * grid.height));
+        return grid.heights[cy * grid.width + cx];
+      }
+      return Math.max(0, (pixel(x0, y0) * (1-fx) + pixel(x0+1, y0) * fx) * (1-fy)
+        + (pixel(x0, y0+1) * (1-fx) + pixel(x0+1, y0+1) * fx) * fy);
     }
 
-    function buildMesh(z, x, y, flat) {
+    function heightMode() {
+      return (HK.heightDebug && HK.heightDebug.mode) || 'auto';
+    }
+
+    function heightAt(lat, lon, x, z) {
+      if (flatDebug) return 0;
+      if (heightMode() === 'baked') {
+        const local = elevationFn && elevationFn(x, z);
+        return local == null ? 0 : Math.max(0, local);
+      }
+      // Online surfaces NEVER combine the old atlas/local DTM with Terrarium.
+      // Missing DEM is provisional 0 for every LOD, invalidated on every arrival.
+      return sampleTerrarium(lat, lon) ?? 0;
+    }
+
+    function buildMesh(z, x, y) {
       const positions = [], uvs = [], indices = [];
       for (let r = 0; r < GRID; r++) {
         const vt = r / (GRID - 1);
@@ -234,14 +290,37 @@ const HK = (() => {
           const lon = tile2lon(x + ut, z);
           const lat = tile2lat(y + vt, z);
           const p = toXZ(lat, lon);
-          positions.push(p.x, flat ? -0.5 : heightAt(lat, lon, p.x, p.z), p.z);
-          uvs.push(ut, 1 - vt);
+          // vt=0 is the north edge (tile row y), vt=1 is south (y+1).
+          // With UNPACK_FLIP_Y_WEBGL=0, v=0 samples the top row of the PNG,
+          // which is north in XYZ / Web Mercator tiles. Using 1-vt flipped
+          // every tile, breaking coastlines and leaving rectangular seams.
+          positions.push(p.x, heightAt(lat, lon, p.x, p.z), p.z);
+          uvs.push(ut, vt);
         }
       }
       for (let r = 0; r < GRID - 1; r++) {
         for (let c = 0; c < GRID - 1; c++) {
           const i = r * GRID + c;
           indices.push(i, i + 1, i + GRID, i + 1, i + GRID + 1, i + GRID);
+        }
+      }
+      const topCount = indices.length;
+      // Vertical edge skirts cover T-junction cracks where two non-overlapping
+      // patches have different tessellation. They have zero horizontal area;
+      // unlike the old coarse layer they cannot cover a town/hill interior.
+      if (layerMode !== 'legacy') {
+        const edges = [[], [], [], []];
+        for (let i = 0; i < GRID; i++) {
+          edges[0].push(i); edges[1].push(i * GRID + GRID - 1);
+          edges[2].push((GRID - 1) * GRID + i); edges[3].push(i * GRID);
+        }
+        for (const edge of edges) for (let j = 0; j < edge.length - 1; j++) {
+          const a = edge[j], b = edge[j+1], lo = positions.length / 3;
+          for (const i of [a, b]) {
+            positions.push(positions[i*3], positions[i*3+1] - 150, positions[i*3+2]);
+            uvs.push(uvs[i*2], uvs[i*2+1]);
+          }
+          indices.push(a, b, lo, b, lo+1, lo);
         }
       }
       const buffer = gl.createBuffer();
@@ -256,30 +335,28 @@ const HK = (() => {
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
       gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STATIC_DRAW);
-      return { buffer, count: indices.length };
+      return { buffer, count: indices.length, topCount, revision: terrainRevision };
     }
 
-    function maybeMesh(z, x, y, flat) {
-      const key = tileKey('mesh', z, x, y);
-      if (meshes.has(key)) {
-        if (!flat && !meshes.get(key).hasHeight && terrains.size) {
-          gl.deleteBuffer(meshes.get(key).buffer);
-          const rebuilt = buildMesh(z, x, y, false);
-          rebuilt.hasHeight = true;
-          meshes.set(key, rebuilt);
-        }
-        return;
+    function surfaceTiles() {
+      if (!planDirty) return surfacePlan;
+      const available = [...images.keys()].filter(k => k.startsWith('img/')).map(k => {
+        const [, z, x, y] = k.split('/').map(Number);
+        return { z, x, y };
+      });
+      surfacePlan = planSurfaceTiles(available, layerMode);
+      const wanted = new Set(surfacePlan.map(t => tileKey('mesh', t.z, t.x, t.y)));
+      for (const [key, mesh] of meshes) if (!wanted.has(key)) {
+        gl.deleteBuffer(mesh.buffer); meshes.delete(key);
       }
-      if (!flat) {
-        const { lon, lat } = { lon: tile2lon(x + 0.5, z), lat: tile2lat(y + 0.5, z) };
-        const parent = tileKey('ter', TERRAIN_Z, Math.floor(lon2tile(lon, TERRAIN_Z)), Math.floor(lat2tile(lat, TERRAIN_Z)));
-        if (!terrains.has(parent) && !(elevationFn && elevationFn(toXZ(lat, lon).x, toXZ(lat, lon).z) != null)) {
-          return;
-        }
-      }
-      const built = buildMesh(z, x, y, flat);
-      built.hasHeight = !flat;
-      meshes.set(key, built);
+      planDirty = false;
+      return surfacePlan;
+    }
+
+    function rebuildAllMeshes() {
+      terrainRevision++;
+      for (const mesh of meshes.values()) gl.deleteBuffer(mesh.buffer);
+      meshes.clear();
     }
 
     function enqueue(job) {
@@ -297,17 +374,16 @@ const HK = (() => {
           if (job.kind === 'terrain') {
             terrains.set(job.key, decodeTerrarium(image));
             loadedTerrain++;
-            for (const imgKey of [...images.keys()]) {
-              const parts = imgKey.split('/');
-              if (parts[0] === 'img' && +parts[1] === IMAGE_Z) maybeMesh(+parts[1], +parts[2], +parts[3], false);
-            }
+            // All LODs depend on the same DEM. In r8 only z15 was rebuilt,
+            // leaving z12 permanently on pre-download/local elevations.
+            rebuildAllMeshes();
           } else {
             rememberImage(job.key, image);
             loadedImages++;
-            maybeMesh(job.z, job.x, job.y, job.z === BASE_Z);
+
           }
           status.failed = failed;
-          if (loadedImages + loadedTerrain > 0) {
+          if (loadedImages > 0) {
             status.mode = 'online';
             status.message = '全港地圖（需網絡）';
           }
@@ -331,17 +407,6 @@ const HK = (() => {
     }
 
     function evict(tcx, tcy, icx, icy) {
-      for (const [key, mesh] of [...meshes]) {
-        const parts = key.split('/');
-        const z = +parts[1], x = +parts[2], y = +parts[3];
-        if (z === BASE_Z) continue;
-        const cc = z === IMAGE_Z ? icx : tcx;
-        const cr = z === IMAGE_Z ? icy : tcy;
-        if (Math.abs(x - cc) > KEEP_RADIUS || Math.abs(y - cr) > KEEP_RADIUS) {
-          gl.deleteBuffer(mesh.buffer);
-          meshes.delete(key);
-        }
-      }
       for (const key of [...textures.keys()]) {
         const parts = key.split('/');
         const z = +parts[1], x = +parts[2], y = +parts[3];
@@ -349,24 +414,25 @@ const HK = (() => {
           gl.deleteTexture(textures.get(key));
           textures.delete(key);
           images.delete(key);
+          planDirty = true;
         }
       }
-      for (const key of [...terrains.keys()]) {
-        const parts = key.split('/');
-        if (Math.abs(+parts[2] - tcx) > KEEP_RADIUS || Math.abs(+parts[3] - tcy) > KEEP_RADIUS) {
-          terrains.delete(key);
+      // Keep a wider DEM halo than photos; never change the height underneath
+      // still-visible coarse patches merely because the drone crossed a tile.
+      // Bounded cache for long exploratory sessions (96 * 256² * 4 = 24 MiB).
+      if (terrains.size > 96) {
+        for (const key of [...terrains.keys()]) {
+          const parts = key.split('/');
+          if (Math.abs(+parts[2] - tcx) > KEEP_RADIUS + 2 || Math.abs(+parts[3] - tcy) > KEEP_RADIUS + 2)
+            terrains.delete(key);
+          if (terrains.size <= 96) break;
         }
+        rebuildAllMeshes();
       }
     }
 
     function requestAround(x, z) {
       const { lat, lon } = toLonLat(x, z);
-      if (!lastBase) {
-        tilesCovering(WEST, SOUTH, EAST, NORTH, BASE_Z).forEach(t => {
-          enqueue({ kind: 'image', key: tileKey('img', t.z, t.x, t.y), ...t });
-        });
-        lastBase = true;
-      }
       const tcx = Math.floor(lon2tile(lon, TERRAIN_Z));
       const tcy = Math.floor(lat2tile(lat, TERRAIN_Z));
       const icx = Math.floor(lon2tile(lon, IMAGE_Z));
@@ -389,6 +455,17 @@ const HK = (() => {
           });
         }
       }
+      if (!lastBase) {
+        tilesCovering(WEST, SOUTH, EAST, NORTH, BASE_Z).forEach(t => {
+          enqueue({ kind: 'image', key: tileKey('img', t.z, t.x, t.y), ...t });
+        });
+        lastBase = true;
+      }
+      // Near DEM/photos first, not the whole-HK overview ahead of the drone.
+      queue.sort((a, b) => {
+        const priority = t => t.kind === 'terrain' ? 0 : t.z === IMAGE_Z ? 1 : 2;
+        return priority(a) - priority(b);
+      });
       pump();
       evict(tcx, tcy, icx, icy);
     }
@@ -403,12 +480,16 @@ const HK = (() => {
       gl.uniform1i(uniforms.photo, 0);
       gl.enableVertexAttribArray(aPos);
       gl.enableVertexAttribArray(aUv);
-      const order = [...meshes.entries()].map(([key, mesh]) => ({
-        key, mesh, z: +key.split('/')[1]
-      })).sort((a, b) => a.z - b.z);
-      for (const { key, mesh, z } of order) {
-        const parts = key.split('/');
-        const texKey = tileKey('img', z, +parts[2], +parts[3]);
+      const plan = surfaceTiles();
+      lastDrawStats = { patches: plan.length, topTriangles: 0, skirtTriangles: 0, missingPhotos: 0 };
+      for (const t of plan) {
+        const { z, x, y, photo } = t;
+        const key = tileKey('mesh', z, x, y);
+        if (!meshes.has(key)) meshes.set(key, buildMesh(z, x, y));
+        const mesh = meshes.get(key);
+        const texKey = tileKey('img', photo.z, photo.x, photo.y);
+        const scale = 2 ** (photo.z - z);
+        gl.uniform4f(uniforms.photoTransform, scale, scale, x * scale - photo.x, y * scale - photo.y);
         gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buffer);
         gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 20, 0);
         gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 20, 12);
@@ -417,24 +498,33 @@ const HK = (() => {
           gl.bindTexture(gl.TEXTURE_2D, textures.get(texKey));
           gl.uniform1f(uniforms.hasPhoto, 1);
         } else {
+          lastDrawStats.missingPhotos++;
           gl.uniform1f(uniforms.hasPhoto, 0);
           gl.uniform3f(uniforms.fallbackColour, 0.35, 0.48, 0.36);
         }
-        gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+        // No polygon offset / overlapping coarse underlay. The partition
+        // already excludes each fine tile's footprint from its parent.
+        lastDrawStats.topTriangles += mesh.topCount / 3;
+        lastDrawStats.skirtTriangles += hideSkirts ? 0 : (mesh.count - mesh.topCount) / 3;
+        gl.drawArrays(gl.TRIANGLES, 0, hideSkirts ? mesh.topCount : mesh.count);
       }
     }
 
     function terrainElevation(x, z) {
-      const local = elevationFn ? elevationFn(x, z) : null;
-      if (local != null) return Math.max(0, local);
       const { lat, lon } = toLonLat(x, z);
-      const tx = lon2tile(lon, TERRAIN_Z);
-      const ty = lat2tile(lat, TERRAIN_Z);
-      const key = tileKey('ter', TERRAIN_Z, Math.floor(tx), Math.floor(ty));
-      const grid = terrains.get(key);
-      if (!grid) return null;
-      return Math.max(0, sampleHeightGrid(grid, tx - Math.floor(tx), ty - Math.floor(ty)));
+      if (status.mode === 'offline' && heightMode() !== 'tiles' && elevationFn) {
+        const local = elevationFn(x, z);
+        return local == null ? 0 : Math.max(0, local);
+      }
+      return heightAt(lat, lon, x, z);
     }
+
+    function setHeightMode(mode) {
+      if (mode !== 'auto' && mode !== 'tiles' && mode !== 'baked') return;
+      HK.heightDebug.mode = mode;
+      rebuildAllMeshes();
+    }
+    function getHeightMode() { return heightMode(); }
 
     function paintMinimap(ctx, craft) {
       const width = ctx.canvas.width, height = ctx.canvas.height;
@@ -460,14 +550,30 @@ const HK = (() => {
       return worldToPix;
     }
 
-    return { requestAround, draw, terrainElevation, paintMinimap, status, bounds };
+    function debugSnapshot() {
+      return {
+        layerMode, flatDebug, hideSkirts, lastDrawStats: { ...lastDrawStats },
+        terrainRevision, loadedImages, loadedTerrain,
+        pending: queue.length, inflight, failed, meshCount: meshes.size,
+        surface: surfaceTiles().map(t => ({ ...t, photo: { ...t.photo } })),
+        meshRevisions: [...meshes.values()].map(m => m.revision)
+      };
+    }
+    return { requestAround, draw, terrainElevation, paintMinimap, status, bounds, setHeightMode, getHeightMode, rebuildAllMeshes, debugSnapshot };
+  }
+
+  const heightDebug = { mode: 'auto' };
+  if (typeof location !== 'undefined' && location.search) {
+    const q = new URLSearchParams(location.search);
+    if (q.get('tilesOnly') === '1' || q.get('height') === 'tiles') heightDebug.mode = 'tiles';
+    else if (q.get('height') === 'baked') heightDebug.mode = 'baked';
   }
 
   return {
     ORIGIN_LAT, ORIGIN_LON, bounds, places, MAX_ALTITUDE, MIN_AGL,
-    LANDSD_LOGO, IMAGERY_TMPL, TERRAIN_TMPL,
+    LANDSD_LOGO, IMAGERY_TMPL, TERRAIN_TMPL, heightDebug,
     toXZ, toLonLat, lon2tile, lat2tile, tile2lon, tile2lat,
-    tilesCovering, tileKey, createTileManager,
+    tilesCovering, tileKey, tileBoundsXZ, planSurfaceTiles, createTileManager,
     WEST, EAST, SOUTH, NORTH, BASE_Z, TERRAIN_Z, IMAGE_Z
   };
 })();

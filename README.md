@@ -4,7 +4,7 @@
 
 **https://hkrgb.github.io/hk-drone-flight/**
 
-版本：**r6-20261121-2335**。全程最低離地高度 200 米。全港地圖按位置分塊載入，不需一次下載全境。圖磚未到也可先開始；網絡圖磚失敗時會改用長洲離線地圖並在畫面標示。
+版本：**r10-20261122-0110**。全程最低離地高度 200 米。全港地圖按位置分塊載入，不需一次下載全境。圖磚未到也可先開始；網絡圖磚失敗時會改用長洲離線地圖並在畫面標示。
 
 ## 操作
 
@@ -30,3 +30,7 @@
 - 無人機模型：Sketchfab “[non-military consumer UAV drone](https://sketchfab.com/3d-models/non-military-consumer-uav-drone-7558fc3a77d4412dad2a02d9d7c3fbb7)” by [FamousUnityHubSoldier](https://sketchfab.com/FamousUnityHubSoldier)，[Sketchfab Standard](https://sketchfab.com/licenses) 授權。詳細條款見 [`3d model/license.txt`](3d%20model/license.txt)。公開倉庫只包含遊戲運行所需貼圖與轉換後的模型資料，以及授權與出處說明；不含原始 `.gltf` / `.bin` 獨立模型檔。
 
 本倉庫只發布可在瀏覽器遊玩的靜態網頁，沒有本機啟動腳本或除錯伺服器。
+
+## r10 地圖修正
+
+修正航拍上下方向、粗細地形互相遮蓋及高程更新，移除遮住航拍的舊假碼頭平台；保留任務圓環、無人機模型及最低離地 200 米。已在瀏覽器核對長洲及中環操作。航拍低空仍偏模糊，部分區域仍有拼接感；沒有立體樓宇。

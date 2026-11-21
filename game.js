@@ -1,6 +1,16 @@
 'use strict';
 
-const GAME_BUILD = window.GAME_BUILD || 'r6-20261121-2335';
+const GAME_BUILD = window.GAME_BUILD || 'r10-20261122-0110';
+// Diagnostic switches are explicit and independent of map loading/flight logic.
+// showDock restores the obsolete synthetic platform ONLY for identification.
+const renderQuery = new URLSearchParams(location.search);
+const renderOptions = Object.freeze(Object.fromEntries(
+  ['hideObjects', 'hideMap', 'hideDrone', 'showDock', 'objectTint']
+    .map(name => [name, renderQuery.get(name) === '1'])
+));
+let lastObjectCounts = { dockVertices: 0, missionVertices: 0 };
+let lastRenderFrame = {};
+
 function reportInitError(stage, error) {
   const message = String(error && (error.message || error) || 'unknown error').replace(/\s+/g, ' ').slice(0, 280);
   if (typeof window.__diag === 'function') {
@@ -71,6 +81,7 @@ const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 const run = { mode: 'ready', next: 0, time: 0, camera: false, explore: false };
 let tiles = null;
 let bakedLand = null;
+const atlasTextures = [];
 let droneRenderer = null;
 const craft = { x: 0, y: 4, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0 };
 const keys = new Set();
@@ -130,11 +141,22 @@ function bakedElevation(x, z) {
   return upper * (1 - south) + lower * south;
 }
 
+function heightMode() {
+  if (tiles && tiles.getHeightMode) return tiles.getHeightMode();
+  return (typeof HK !== 'undefined' && HK.heightDebug && HK.heightDebug.mode) || 'auto';
+}
+
 function elevation(x, z) {
+  const mode = heightMode();
+  if (mode === 'baked') {
+    const baked = bakedElevation(x, z);
+    return baked == null ? 0 : baked;
+  }
   if (tiles) {
     const streamed = tiles.terrainElevation(x, z);
     if (streamed != null) return streamed;
   }
+  if (mode === 'tiles') return 0;
   const baked = bakedElevation(x, z);
   return baked == null ? 0 : baked;
 }
@@ -289,6 +311,7 @@ function shader(type, source) {
 
 function loadAtlas(unit, url) {
   const texture = gl.createTexture();
+  atlasTextures[unit] = texture;
   function upload(source) {
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -296,6 +319,7 @@ function loadAtlas(unit, url) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
   }
   upload(new ImageData(1, 1));
@@ -611,6 +635,7 @@ function initializeRenderer() {
   let landCount = 0;
   let bakedReady = false;
   function ensureBakedLandscape() {
+    if (heightMode() === 'tiles' || (tiles && tiles.status.mode !== 'offline')) return;
     if (bakedReady) return;
     const land = createLandscape();
     landCount = land.length;
@@ -623,7 +648,23 @@ function initializeRenderer() {
   gl.uniform1i(uniforms.overviewPhoto, 0);
   gl.uniform1i(uniforms.detailPhoto, 1);
   tiles = HK.createTileManager(gl, bakedElevation);
+  // Read-only diagnostics for local visual A/B, no browser automation needed.
+  window.mapDebug = () => tiles.debugSnapshot();
+  window.renderDebug = () => ({
+    options: { ...renderOptions }, objects: { ...lastObjectCounts },
+    frame: { ...lastRenderFrame }, craft: { ...craft },
+    map: tiles.debugSnapshot()
+  });
   tiles.requestAround(craft.x, craft.z);
+  if (byId('height-mode')) {
+    byId('height-mode').value = tiles.getHeightMode();
+    byId('height-mode').addEventListener('change', event => {
+      tiles.setHeightMode(event.target.value);
+      const statusNode = byId('map-status');
+      const labels = { auto: '自動（全球高程）', tiles: '只用全球圖磚', baked: '只用本地長洲高程' };
+      if (statusNode) statusNode.textContent = '高程來源：' + (labels[event.target.value] || event.target.value);
+    });
+  }
   try {
     droneRenderer = createDroneRenderer(gl);
   } catch (error) {
@@ -702,7 +743,7 @@ function initializeRenderer() {
     }
     const offline = tiles.status.mode === 'offline';
     if (offline) ensureBakedLandscape();
-    if (!offline) tiles.draw(camera);
+    if (!offline && !renderOptions.hideMap) tiles.draw(camera);
     gl.useProgram(program);
     gl.enableVertexAttribArray(position);
     gl.enableVertexAttribArray(colour);
@@ -711,7 +752,13 @@ function initializeRenderer() {
     gl.uniform3fv(uniforms.upAxis, camera.up);
     gl.uniform3fv(uniforms.forwardAxis, camera.forward);
     gl.uniform2f(uniforms.lens, camera.fx, camera.fy);
-    if (bakedReady && (offline || tiles.status.mode === 'loading')) {
+    if (bakedReady && offline && !renderOptions.hideMap) {
+      // Tile/drone draws also use texture units 0/1; never depend on a
+      // previous async atlas upload leaving those global bindings intact.
+      atlasTextures.forEach((texture, unit) => {
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+      });
       gl.uniform1f(uniforms.photoSurface, 1);
       draw(landscape, landCount);
     }
@@ -719,8 +766,14 @@ function initializeRenderer() {
     const geometry = createObjects(seconds);
     gl.bindBuffer(gl.ARRAY_BUFFER, objects);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geometry), gl.DYNAMIC_DRAW);
-    draw(objects, geometry.length);
-    if (droneRenderer) droneRenderer.draw(camera);
+    if (!renderOptions.hideObjects) draw(objects, geometry.length);
+    if (droneRenderer && !renderOptions.hideDrone) droneRenderer.draw(camera);
+    lastRenderFrame = {
+      mapVisible: !renderOptions.hideMap, offlineLandscape: offline && bakedReady && !renderOptions.hideMap,
+      objectsDrawn: !renderOptions.hideObjects, droneDrawn: !!droneRenderer && !renderOptions.hideDrone,
+      objectVertices: renderOptions.hideObjects ? 0 : geometry.length / 6,
+      eye: camera.eye.slice(), forward: camera.forward.slice()
+    };
   };
 }
 
@@ -760,7 +813,7 @@ function createLandscape() {
     const z = (106.85 - row * .3) * 111;
     return Array.from({ length: 801 }, (_, column) => {
       const x = (column * .15 - 46.7) * 103;
-      return [x,elevation(x,z),z];
+      return [x,bakedElevation(x,z) ?? 0,z];
     });
   }
   let north = gridRow(0);
@@ -779,8 +832,16 @@ function createLandscape() {
 
 function createObjects(seconds) {
   const out = [];
-  box(out,0,1,0,62,2,64,[.48,.54,.49]);
-  for (const x of [-27,27]) box(out,x,2.08,0,1,.15,55,[.77,.78,.63]);
+  // The old game invented a 62 x 64 m concrete box at world origin, y=0..2,
+  // with two pale strips. It is not surveyed dock geometry. Terrarium cuts
+  // through that flat box, leaving two grey polygons on top of the aerial
+  // photograph. Remove it by default; the mission target remains unchanged.
+  if (renderOptions.showDock) {
+    box(out,0,1,0,62,2,64,renderOptions.objectTint ? [1,0,1] : [.48,.54,.49]);
+    for (const x of [-27,27]) box(out,x,2.08,0,1,.15,55,
+      renderOptions.objectTint ? [1,1,0] : [.77,.78,.63]);
+  }
+  const dockVertices = out.length / 6;
   const target = route[run.next];
   const returning = run.next === 0 || run.next === 4;
   const angleToDrone = bearing(target,craft);
@@ -797,9 +858,10 @@ function createObjects(seconds) {
     for (let i=0;i<48;i++) {
       const a = i*Math.PI/24, b = (i+.86)*Math.PI/24;
       quad(out,ringPoint(a,radius-stripe),ringPoint(a,radius),
-        ringPoint(b,radius),ringPoint(b,radius-stripe),returning?[.33,.96,.55]:[1,.65,.18]);
+        ringPoint(b,radius),ringPoint(b,radius-stripe),renderOptions.objectTint ? [0,1,1] : returning?[.33,.96,.55]:[1,.65,.18]);
     }
   }
+  lastObjectCounts = { dockVertices, missionVertices: out.length / 6 - dockVertices };
   return out;
 }
 

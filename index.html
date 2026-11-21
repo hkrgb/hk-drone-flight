@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Cache-Control" content="no-store">
 <title>長洲飛行隊｜香港巡航</title>
-<link rel="stylesheet" href="style.css?v=r6-20261121-2335">
+<link rel="stylesheet" href="style.css?v=r10-20261122-0110">
 <script>
-window.GAME_BUILD = 'r6-20261121-2335';
+window.GAME_BUILD = 'r10-20261122-0110';
 window.GAME_DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 if (!window.GAME_DEBUG) document.documentElement.classList.add('release');
 document.addEventListener('DOMContentLoaded', function() {
@@ -63,12 +63,12 @@ window.addEventListener('unhandledrejection', function(ev) {
   });
 });
 </script>
-<script defer src="terrain.js?v=r6-20261121-2335"></script>
-<script defer src="local-heights.js?v=r6-20261121-2335"></script>
-<script defer src="imagery.js?v=r6-20261121-2335"></script>
-<script defer src="drone-model.js?v=r6-20261121-2335"></script>
-<script defer src="hk-map.js?v=r6-20261121-2335"></script>
-<script defer src="game.js?v=r6-20261121-2335"></script>
+<script defer src="terrain.js?v=r10-20261122-0110"></script>
+<script defer src="local-heights.js?v=r10-20261122-0110"></script>
+<script defer src="imagery.js?v=r10-20261122-0110"></script>
+<script defer src="drone-model.js?v=r10-20261122-0110"></script>
+<script defer src="hk-map.js?v=r10-20261122-0110"></script>
+<script defer src="game.js?v=r10-20261122-0110"></script>
 </head>
 <body>
 <main>
@@ -76,7 +76,7 @@ window.addEventListener('unhandledrejection', function(ev) {
 <header>
   <div class="brand">長洲飛行隊 <small>HONG KONG AIR SURVEY</small></div>
   <div class="header-tools">
-    <div id="build-id" title="版本識別" hidden>版本 r6-20261121-2335</div>
+    <div id="build-id" title="版本識別" hidden>版本 r10-20261122-0110</div>
     <label class="place-label">出發點 <select id="place"></select></label>
     <button id="camera" disabled>切換視角 <kbd>C</kbd></button>
   </div>
@@ -84,7 +84,12 @@ window.addEventListener('unhandledrejection', function(ev) {
 <section class="mission"><small>離島巡航</small><h1 id="target">長洲碼頭</h1><p id="guide" aria-live="polite">準備起飛</p><p id="mission-note" hidden>自由飛行中。長洲巡航任務只在碼頭出發後進行。</p><ol id="route"></ol></section>
 <div id="marker" hidden></div>
 <div id="reticle" hidden>＋</div>
-<aside class="map"><canvas id="map" width="180" height="160" aria-label="航線小地圖"></canvas><small id="map-status">北 ↑　載入全港地圖…</small></aside>
+<aside class="map"><canvas id="map" width="180" height="160" aria-label="航線小地圖"></canvas><small id="map-status">北 ↑　載入全港地圖…</small>
+    <label class="height-mode-label">高程 <select id="height-mode" title="用來對比全球圖磚與本地長洲高程">
+      <option value="auto">自動（全球高程＋航拍）</option>
+      <option value="tiles">只用全球圖磚</option>
+      <option value="baked">只用本地長洲高程／地圖</option>
+    </select></label></aside>
 <section class="telemetry" aria-label="飛行儀表">
 <div><small>海拔</small><strong id="height">0</strong> m</div><div><small>離地</small><strong id="agl">200</strong> m</div><div><small>地速</small><strong id="speed">0</strong> km/h</div><div><small>航向</small><strong id="heading">000</strong> °</div><div><small>電量</small><strong id="battery">100</strong> %</div>
 </section>
