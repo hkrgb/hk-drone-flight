@@ -1,10 +1,13 @@
 'use strict';
 
-const GAME_BUILD = window.GAME_BUILD || 'r11-20261122-1100';
+function gameEntries(entries) { const result = {}; for (const pair of entries) result[pair[0]] = pair[1]; return result; }
+const LOW_POWER = !!window.GAME_LOW_POWER;
+if (window.__startup) window.__startup('webgl', '正在建立 3D 畫面（' + (LOW_POWER ? '手機省資源' : '標準') + '）', false);
+const GAME_BUILD = window.GAME_BUILD || 'r12-20261122-1155';
 // Diagnostic switches are explicit and independent of map loading/flight logic.
 // showDock restores the obsolete synthetic platform ONLY for identification.
 const renderQuery = new URLSearchParams(location.search);
-const renderOptions = Object.freeze(Object.fromEntries(
+const renderOptions = Object.freeze(gameEntries(
   ['hideObjects', 'hideMap', 'hideDrone', 'showDock', 'objectTint']
     .map(name => [name, renderQuery.get(name) === '1'])
 ));
@@ -26,6 +29,7 @@ function reportInitError(stage, error) {
 }
 function showInitFailure(stage, error) {
   const detail = reportInitError(stage, error);
+  if (window.__startup) window.__startup('error', stage + ': ' + detail, false);
   start.disabled = true;
   start.dataset.unlocked = '0';
   start.textContent = '未能開始飛行';
@@ -52,6 +56,7 @@ function allSettled(promises) {
 function enableFlightStart() {
   if (start.dataset.unlocked === '1' || start.textContent === '未能開始飛行') return;
   start.dataset.unlocked = '1';
+  if (window.__startup) window.__startup('ready', (LOW_POWER ? '手機省資源模式' : '3D 畫面') + '已就緒；地圖會在起飛後逐步載入', true);
   start.textContent = '開始任務';
   start.disabled = false;
   if (byId('explore')) byId('explore').disabled = false;
@@ -64,9 +69,18 @@ function enableFlightStart() {
 
 const byId = id => document.getElementById(id);
 const canvas = byId('world');
-const gl = canvas.getContext('webgl', { antialias: true });
+const gl = canvas.getContext('webgl', { antialias: !LOW_POWER, powerPreference: LOW_POWER ? 'low-power' : 'default' });
 const map = byId('map').getContext('2d');
 const start = byId('start');
+let contextLost = false;
+canvas.addEventListener('webglcontextlost', event => {
+  event.preventDefault();
+  contextLost = true;
+  clearFlightInput();
+  byId('overlay').hidden = false;
+  showInitFailure('context-lost', Error('手機 3D 資源已中斷；請用相容模式重載'));
+});
+
 // Named OSM objects cross-checked against LandsD's Cheung Chau GeoPDF.
 // Nam Tam is the actual locality, NOT Po Toi's identically named bay.
 const MISSION_TIME_LIMIT = 600;
@@ -93,6 +107,21 @@ let tiles = null;
 let bakedLand = null;
 const atlasTextures = [];
 let droneRenderer = null;
+let droneAssetState = 'waiting';
+const lazyScripts = {};
+function loadGameScript(file) {
+  if (lazyScripts[file]) return lazyScripts[file];
+  lazyScripts[file] = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = file + '?v=' + GAME_BUILD;
+    script.fetchPriority = 'low';
+    script.dataset.optional = '1';
+    script.onload = resolve;
+    script.onerror = () => { delete lazyScripts[file]; reject(Error(file + ' 載入失敗')); };
+    document.head.appendChild(script);
+  });
+  return lazyScripts[file];
+}
 const craft = { x: 0, y: 4, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0 };
 const keys = new Set();
 const pointers = new Map();
@@ -123,9 +152,22 @@ function terrainSample(column, row) {
   return Math.max(0, (sample << 16 >> 16) / 10);
 }
 
-const detailGrid = window.HK_DEPARTURE_TERRAIN;
-const detailBytes = atob(detailGrid.data);
+let detailGrid = window.HK_DEPARTURE_TERRAIN || null;
+let detailBytes = detailGrid ? atob(detailGrid.data) : '';
+let offlineDataPromise = null;
+function loadOfflineData() {
+  if (detailGrid && typeof terrainBytes !== 'undefined') return Promise.resolve();
+  if (!offlineDataPromise) offlineDataPromise = Promise.all([
+    typeof terrainBytes !== 'undefined' ? Promise.resolve() : loadGameScript('terrain.js'),
+    detailGrid ? Promise.resolve() : loadGameScript('local-heights.js')
+  ]).then(() => {
+    detailGrid = window.HK_DEPARTURE_TERRAIN;
+    detailBytes = atob(detailGrid.data);
+  }).catch(error => { offlineDataPromise = null; throw error; });
+  return offlineDataPromise;
+}
 function bakedElevation(x, z) {
+  if (!detailGrid || typeof terrainBytes === 'undefined') return null;
   const c = (x / 103 - 73.3 - detailGrid.x) / detailGrid.step;
   const r = (71.85 - z / 111 - detailGrid.z) / detailGrid.step;
   if (c >= 0 && r >= 0 && c < detailGrid.width-1 && r < detailGrid.height-1) {
@@ -172,7 +214,7 @@ function elevation(x, z) {
 }
 
 function selectedPlace() {
-  const id = byId('place')?.value || 'cheung-chau';
+  const id = (byId('place') || {}).value || 'cheung-chau';
   return HK.places.find(place => place.id === id) || HK.places[0];
 }
 
@@ -198,7 +240,7 @@ function placeCraft(place, explore) {
     y: terrainFloor(pos.x, pos.z),
     z: pos.z,
     vx: 0, vy: 0, vz: 0,
-    yaw: place.yaw ?? 0
+    yaw: place.yaw == null ? 0 : place.yaw
   });
 }
 
@@ -211,6 +253,7 @@ function startFlight(explore = false) {
   clearFlightInput();
   byId('overlay').hidden = true;
   byId('camera').disabled = false;
+  if (window.__loadDrone) window.__loadDrone();
   start.blur();
   if (byId('mission-note')) {
     byId('mission-note').hidden = !free;
@@ -267,8 +310,8 @@ function toggleCamera() {
 }
 
 start.addEventListener('click', () => startFlight(false));
-byId('explore')?.addEventListener('click', () => startFlight(true));
-byId('place')?.addEventListener('change', () => {
+byId('explore').addEventListener('click', () => startFlight(true));
+byId('place').addEventListener('change', () => {
   const place = selectedPlace();
   if (run.mode === 'flying') {
     startFlight(true);
@@ -348,6 +391,14 @@ function loadAtlas(unit, url) {
   const texture = gl.createTexture();
   atlasTextures[unit] = texture;
   function upload(source) {
+    if (LOW_POWER && Math.max(source.width || 0, source.height || 0) > 1024) {
+      const reduced = document.createElement('canvas');
+      const scale = 1024 / Math.max(source.width, source.height);
+      reduced.width = Math.max(1, Math.round(source.width * scale));
+      reduced.height = Math.max(1, Math.round(source.height * scale));
+      reduced.getContext('2d').drawImage(source, 0, 0, reduced.width, reduced.height);
+      source = reduced;
+    }
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -356,15 +407,16 @@ function loadAtlas(unit, url) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    return source;
   }
   upload(new ImageData(1, 1));
   return new Promise((resolve, reject) => {
     const image = new Image();
     image.onload = () => {
       try {
-        upload(image);
+        const atlasImage = upload(image);
         if (gl.getError() !== gl.NO_ERROR) throw Error('Imagery texture upload failed');
-        chartImages[unit] = image;
+        chartImages[unit] = atlasImage;
         paintChart();
         resolve();
       } catch (error) {
@@ -409,11 +461,20 @@ function loadTexture(gl, url) {
     };
     if (!url) return finish(false, Error('Missing drone texture url'));
     const image = new Image();
+    image.fetchPriority = 'low';
     image.onload = () => {
       try {
         gl.bindTexture(gl.TEXTURE_2D, texture);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        let source = image;
+        if (LOW_POWER && Math.max(image.width, image.height) > 512) {
+          source = document.createElement('canvas');
+          const scale = 512 / Math.max(image.width, image.height);
+          source.width = Math.max(1, Math.round(image.width * scale));
+          source.height = Math.max(1, Math.round(image.height * scale));
+          source.getContext('2d').drawImage(image, 0, 0, source.width, source.height);
+        }
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
         const code = gl.getError();
         if (code !== gl.NO_ERROR) throw Error('Texture upload failed (' + code + '): ' + url);
         try {
@@ -438,10 +499,26 @@ function loadTexture(gl, url) {
   return { texture, ready };
 }
 
+// Common body transform, used AFTER each original propeller's local spin.
+function droneModelBasis(state) {
+  const sy = Math.sin(state.yaw), cy = Math.cos(state.yaw);
+  const forward = state.vx * sy + state.vz * cy;
+  const side = state.vx * cy - state.vz * sy;
+  const pitch = -clamp(forward / 51, -1, 1) * .10;
+  const roll = -clamp(side / 51, -1, 1) * .10;
+  const sx = Math.sin(pitch), cx = Math.cos(pitch), sz = Math.sin(roll), cz = Math.cos(roll);
+  // R_y(yaw) * R_x(pitch) * R_z(roll), column-major for WebGL.
+  return new Float32Array([
+    cy*cz+sy*sx*sz, cx*sz, -sy*cz+cy*sx*sz,
+    -cy*sz+sy*sx*cz, cx*cz, sy*sz+cy*sx*cz,
+    sy*cx, -sx, cy*cx
+  ]);
+}
+
 function createDroneRenderer(gl) {
   const model = window.DRONE_MODEL;
   if (!model) throw Error('Drone model data missing');
-  const vary = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT)?.precision
+  const vary = (gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT) || {}).precision
     ? 'highp' : 'mediump';
   const program = gl.createProgram();
   gl.attachShader(program, shader(gl.VERTEX_SHADER, `
@@ -450,32 +527,26 @@ function createDroneRenderer(gl) {
     attribute vec4 tangent;
     attribute vec2 uv;
     uniform vec3 eye, rightAxis, upAxis, forwardAxis, modelPos;
-    uniform vec2 lens, modelYaw;
+    uniform vec2 lens, rotorSpin;
+    uniform mat3 modelBasis;
+    uniform vec3 rotorPivot, rotorAxis;
+    vec3 spin(vec3 p) {
+      return p * rotorSpin.x + cross(rotorAxis, p) * rotorSpin.y
+        + rotorAxis * dot(rotorAxis, p) * (1.0 - rotorSpin.x);
+    }
     varying ${vary} vec3 vWorld, vNormal, vTangent;
     varying ${vary} vec2 vUv;
     varying ${vary} float depth, bitangentSign;
     void main() {
-      vec3 local = vec3(
-        position.x * modelYaw.x + position.z * modelYaw.y,
-        position.y,
-        position.z * modelYaw.x - position.x * modelYaw.y
-      );
+      vec3 local = modelBasis * (rotorPivot + spin(position - rotorPivot));
       vec3 world = modelPos + local;
       vec3 delta = world - eye;
       depth = dot(delta, forwardAxis);
       gl_Position = vec4(dot(delta,rightAxis)*lens.x, dot(delta,upAxis)*lens.y,
                          depth*1.00005-0.4, depth);
       vWorld = world;
-      vNormal = vec3(
-        normal.x * modelYaw.x + normal.z * modelYaw.y,
-        normal.y,
-        normal.z * modelYaw.x - normal.x * modelYaw.y
-      );
-      vTangent = vec3(
-        tangent.x * modelYaw.x + tangent.z * modelYaw.y,
-        tangent.y,
-        tangent.z * modelYaw.x - tangent.x * modelYaw.y
-      );
+      vNormal = modelBasis * spin(normal);
+      vTangent = modelBasis * spin(tangent.xyz);
       bitangentSign = tangent.w;
       vUv = uv;
     }`));
@@ -525,8 +596,17 @@ function createDroneRenderer(gl) {
     throw Error('Drone model buffer size mismatch');
   }
   const packed = new Float32Array(indices.length * 12);
+  const rotorGroups = model.rotorGroups ? new Uint8Array(decodeBuffer(model.rotorGroups)) : new Uint8Array(model.vertexCount);
+  const rotorParts = [[], [], [], [], []];
+  for (let t = 0; t < indices.length; t += 3) {
+    const group = rotorGroups[indices[t]];
+    if (group !== rotorGroups[indices[t+1]] || group !== rotorGroups[indices[t+2]]) throw Error('Rotor triangle crosses component boundary');
+    rotorParts[group].push(indices[t], indices[t+1], indices[t+2]);
+  }
+  const ranges = [], reordered = [];
+  for (const part of rotorParts) { ranges.push({ first: reordered.length, count: part.length }); reordered.push(...part); }
   let w = 0;
-  for (const i of indices) {
+  for (const i of reordered) {
     packed[w++] = positions[i * 3];
     packed[w++] = positions[i * 3 + 1];
     packed[w++] = positions[i * 3 + 2];
@@ -543,8 +623,8 @@ function createDroneRenderer(gl) {
   const buffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
   gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STATIC_DRAW);
-  const uniforms = Object.fromEntries(
-    ['eye','rightAxis','upAxis','forwardAxis','lens','modelPos','modelYaw',
+  const uniforms = gameEntries(
+    ['eye','rightAxis','upAxis','forwardAxis','lens','modelPos','modelBasis','rotorPivot','rotorAxis','rotorSpin',
      'diffuseMap','specGlossMap','normalMap','diffuseFactor','specularFactor','glossinessFactor']
       .map(name => [name, gl.getUniformLocation(program, name)])
   );
@@ -564,6 +644,7 @@ function createDroneRenderer(gl) {
   const stride = 48;
   return {
     ready,
+    debug: () => ({ originalFaces: indices.length / 3, ranges: ranges.map(r => ({ ...r })), rotors: model.rotors, flying: run.mode === 'flying' }),
     draw(camera) {
       if (run.camera) return;
       gl.useProgram(program);
@@ -574,7 +655,7 @@ function createDroneRenderer(gl) {
       gl.uniform3fv(uniforms.forwardAxis, camera.forward);
       gl.uniform2f(uniforms.lens, camera.fx, camera.fy);
       gl.uniform3f(uniforms.modelPos, craft.x, craft.y, craft.z);
-      gl.uniform2f(uniforms.modelYaw, Math.cos(craft.yaw), Math.sin(craft.yaw));
+      gl.uniformMatrix3fv(uniforms.modelBasis, false, droneModelBasis(craft));
       gl.activeTexture(gl.TEXTURE2);
       gl.bindTexture(gl.TEXTURE_2D, maps[0].texture);
       gl.activeTexture(gl.TEXTURE3);
@@ -596,7 +677,19 @@ function createDroneRenderer(gl) {
       gl.vertexAttribPointer(attribs.normal, 3, gl.FLOAT, false, stride, 12);
       gl.vertexAttribPointer(attribs.tangent, 4, gl.FLOAT, false, stride, 24);
       gl.vertexAttribPointer(attribs.uv, 2, gl.FLOAT, false, stride, 40);
-      gl.drawArrays(gl.TRIANGLES, 0, indices.length);
+      gl.uniform3f(uniforms.rotorPivot, 0, 0, 0);
+      gl.uniform3f(uniforms.rotorAxis, 0, 1, 0);
+      gl.uniform2f(uniforms.rotorSpin, 1, 0);
+      gl.drawArrays(gl.TRIANGLES, ranges[0].first, ranges[0].count);
+      for (let i = 0; i < 4; i++) {
+        const rotor = model.rotors && model.rotors[i];
+        if (!rotor || !ranges[i+1].count) continue;
+        const angle = run.mode === 'flying' ? run.time * 75 * rotor.direction : 0;
+        gl.uniform3fv(uniforms.rotorPivot, rotor.pivot);
+        gl.uniform3fv(uniforms.rotorAxis, rotor.axis);
+        gl.uniform2f(uniforms.rotorSpin, Math.cos(angle), Math.sin(angle));
+        gl.drawArrays(gl.TRIANGLES, ranges[i+1].first, ranges[i+1].count);
+      }
       gl.disableVertexAttribArray(attribs.normal);
       gl.disableVertexAttribArray(attribs.tangent);
       gl.disableVertexAttribArray(attribs.uv);
@@ -607,9 +700,8 @@ function createDroneRenderer(gl) {
 function initializeRenderer() {
   if (!gl) throw Error('WebGL unavailable');
   if (typeof HK === 'undefined') throw Error('hk-map.js did not load (HK missing)');
-  if (!window.DRONE_MODEL) throw Error('drone-model.js did not load (DRONE_MODEL missing)');
   const program = gl.createProgram();
-  const varyingPrecision = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT)?.precision
+  const varyingPrecision = (gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT) || {}).precision
     ? 'highp' : 'mediump';
   gl.attachShader(program, shader(gl.VERTEX_SHADER, `
     attribute vec3 position;
@@ -658,19 +750,49 @@ function initializeRenderer() {
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(program));
   gl.useProgram(program);
   gl.enable(gl.DEPTH_TEST);
-  const uniforms = Object.fromEntries(['eye','rightAxis','upAxis','forwardAxis','lens',
+  const uniforms = gameEntries(['eye','rightAxis','upAxis','forwardAxis','lens',
     'overviewPhoto','detailPhoto','overviewReady','detailReady','photoSurface']
     .map(name => [name, gl.getUniformLocation(program, name)]));
   const position = gl.getAttribLocation(program, 'position');
   const colour = gl.getAttribLocation(program, 'colour');
   gl.enableVertexAttribArray(position);
   gl.enableVertexAttribArray(colour);
+  // Complete 1px texture for both samplers even before any optional model,
+  // atlas or map image arrives. Some WebGL1 drivers validate both branches.
+  const emptyPhoto = gl.createTexture();
+  for (let unit = 0; unit < 2; unit++) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, emptyPhoto);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([80,90,100,255]));
+  }
   const landscape = gl.createBuffer();
   const objects = gl.createBuffer();
   let landCount = 0;
-  let bakedReady = false;
+  let bakedReady = false, atlasStarted = false, offlineDataLoading = false, offlineDataRetryAfter = 0;
+  function loadOfflineAtlas() {
+    if (atlasStarted) return;
+    atlasStarted = true;
+    const scriptReady = typeof landsImagery !== 'undefined' ? Promise.resolve() : loadGameScript('imagery.js');
+    scriptReady.then(() => allSettled(landsImagery.map((url, unit) => loadAtlas(unit, url).then(() => {
+      gl.useProgram(program);
+      gl.uniform1f(unit === 0 ? uniforms.overviewReady : uniforms.detailReady, 1);
+    })))).then(results => {
+      if (results.some(result => result.status === 'rejected')) appendBriefing(' 部分離線航拍未能載入。');
+    }).catch(() => appendBriefing(' 離線航拍未能載入，使用備用地形。'));
+  }
   function ensureBakedLandscape() {
-    if (heightMode() === 'tiles' || (tiles && tiles.status.mode !== 'offline')) return;
+    if (run.mode === 'ready' || heightMode() === 'tiles' || (tiles && tiles.status.mode !== 'offline')) return;
+    if (!detailGrid || typeof terrainBytes === 'undefined') {
+      if (!offlineDataLoading && Date.now() >= offlineDataRetryAfter) {
+        offlineDataLoading = true;
+        loadOfflineData().then(() => { offlineDataLoading = false; tiles.rebuildAllMeshes(); })
+          .catch(error => { offlineDataLoading = false; offlineDataRetryAfter = Date.now() + 30000; appendBriefing(' ' + error.message); });
+      }
+      return;
+    }
+    loadOfflineAtlas();
     if (bakedReady) return;
     const land = createLandscape();
     landCount = land.length;
@@ -689,9 +811,10 @@ function initializeRenderer() {
     options: { ...renderOptions }, objects: { ...lastObjectCounts },
     frame: { ...lastRenderFrame }, craft: { ...craft },
     mission: { timeLimit: MISSION_TIME_LIMIT, next: run.next, route: route.map(p => ({ ...p })) },
+    startup: window.__startupInfo, lowPower: LOW_POWER, droneAssetState,
+    rotors: droneRenderer && droneRenderer.debug ? droneRenderer.debug() : null,
     map: tiles.debugSnapshot()
   });
-  tiles.requestAround(craft.x, craft.z);
   if (byId('height-mode')) {
     byId('height-mode').value = tiles.getHeightMode();
     byId('height-mode').addEventListener('change', event => {
@@ -701,63 +824,45 @@ function initializeRenderer() {
       if (statusNode) statusNode.textContent = '高程來源：' + (labels[event.target.value] || event.target.value);
     });
   }
-  try {
-    droneRenderer = createDroneRenderer(gl);
-  } catch (error) {
-    console.error(error);
-    droneRenderer = null;
-    window.__droneInitError = reportInitError('drone-model', error);
+  function startDroneLoad() {
+    if (droneAssetState === 'loading' || droneRenderer) return;
+    droneAssetState = 'loading';
+    const build = () => {
+      try {
+        droneRenderer = createDroneRenderer(gl);
+        droneAssetState = 'texturing';
+        droneRenderer.ready.then(flags => {
+          droneAssetState = flags.every(Boolean) ? 'ready' : 'plain';
+        }).catch(() => { droneAssetState = 'plain'; });
+      } catch (error) {
+        droneAssetState = 'error';
+        window.__droneInitError = reportInitError('drone-model', error);
+      }
+    };
+    if (window.DRONE_MODEL) build();
+    else loadGameScript('drone-model.js').then(build).catch(error => {
+      droneAssetState = 'error';
+      window.__droneInitError = reportInitError('drone-model-download', error);
+    });
   }
-  if (tiles.status.mode === 'offline') ensureBakedLandscape();
-  if (window.__droneInitError) {
-    appendBriefing(' 無人機模型未能載入：' + window.__droneInitError + '。你仍可開始飛行。');
-  }
-  // r5 bug: Start waited on drone textures / atlas. If texImage2D threw
-  // (common on file://) the promise never settled and the button stayed on
-  // 「載入地圖...」 forever, even after the 3D view was already drawing.
+  window.__loadDrone = startDroneLoad;
+  // Keep already-cached model support for offline/test embedding. HTTP bootstrap
+  // doesn't request it until flight begins, so it cannot block the Start button.
+  if (window.DRONE_MODEL) startDroneLoad();
   enableFlightStart();
-  const atlasLoads = (typeof landsImagery !== 'undefined' && landsImagery ? landsImagery : []).map((url, unit) => loadAtlas(unit, url).then(() => {
-    gl.useProgram(program);
-    gl.uniform1f(unit === 0 ? uniforms.overviewReady : uniforms.detailReady, 1);
-  }));
-  const droneReady = droneRenderer ? droneRenderer.ready : Promise.resolve([]);
-  allSettled([droneReady, allSettled(atlasLoads)]).then(([droneResult, atlasWrap]) => {
-    const results = atlasWrap.status === 'fulfilled' ? atlasWrap.value : [];
-    const atlasFailed = !results.length || results.some(item => item.status === 'rejected');
-    const atlasOk = results.some(item => item.status === 'fulfilled');
-    if (atlasFailed) {
-      appendBriefing(atlasOk
-        ? ' 長洲離線航拍圖未能全部載入。'
-        : ' 長洲離線航拍圖載入失敗，已使用備用地形。');
-      ensureBakedLandscape();
-    }
-    if (droneRenderer && droneResult.status === 'fulfilled') {
-      const flags = droneResult.value;
-      const ok = Array.isArray(flags) ? flags.every(Boolean) : !!flags;
-      if (!ok) {
-        const fileHint = (typeof location !== 'undefined' && location.protocol === 'file:')
-          ? '（目前是 file://，瀏覽器可能禁止把本地貼圖傳到 WebGL。請改用「啟動遊戲.bat」開啟 http://127.0.0.1:8770/。）'
-          : '';
-        appendBriefing(' 無人機貼圖未能載入' + fileHint + '機身會以素色顯示。');
-      }
-    } else if (droneResult.status === 'rejected') {
-      reportInitError('drone-texture', droneResult.reason);
-      appendBriefing(' 無人機貼圖載入錯誤：' + (droneResult.reason && (droneResult.reason.message || droneResult.reason)) + '。你仍可開始飛行。');
-    }
-  }).catch(error => {
-    reportInitError('post-init', error);
-    appendBriefing(' 背景資源載入發生錯誤：' + (error && (error.message || error)) + '。你仍可開始飛行。');
-    enableFlightStart();
+  if (byId('map-retry')) byId('map-retry').addEventListener('click', () => {
+    offlineDataRetryAfter = 0;
+    tiles.retry();
+    tiles.requestAround(craft.x, craft.z);
+    if (droneAssetState === 'error') startDroneLoad();
   });
-  setTimeout(() => {
-    if (tiles.status.mode !== 'online') {
-      if (tiles.status.mode === 'loading') {
-        tiles.status.mode = 'offline';
-        tiles.status.message = '全港圖磚未及時回應，已改用長洲離線地圖';
-      }
-      ensureBakedLandscape();
-    }
-  }, 4000);
+  if (byId('height-mode')) byId('height-mode').addEventListener('change', () => {
+    if (heightMode() === 'baked') loadOfflineData().then(() => tiles.rebuildAllMeshes()).catch(error => appendBriefing(error.message));
+  });
+  // A slow phone/network is NOT proof the map is offline. r11's 4-second
+  // timeout synchronously built 370,951 offline triangles (~76 MiB combined
+  // JS-array/float staging) while the start overlay was still displayed.
+  // Only actual tile failure/file:// switches to the bounded offline path.
 
   function draw(buffer, count) {
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -766,12 +871,49 @@ function initializeRenderer() {
     gl.drawArrays(gl.TRIANGLES, 0, count / 6);
   }
 
-  let tileClock = 0;
+  const reference = gl.createBuffer();
+  let referenceGeometry = [], referenceX = null, referenceZ = null;
+  function updateReferenceGrid() {
+    const cx = Math.floor(craft.x / 1000), cz = Math.floor(craft.z / 1000);
+    if (referenceX === cx && referenceZ === cz) return;
+    referenceX = cx; referenceZ = cz; referenceGeometry = [];
+    for (let row = -4; row < 4; row++) for (let col = -4; col < 4; col++) {
+      const x = (col + cx) * 1000, z = (row + cz) * 1000;
+      const tint = (row + col + cx + cz) % 2 ? [.22,.29,.33] : [.27,.34,.38];
+      quad(referenceGeometry, [x,0,z], [x+1000,0,z], [x+1000,0,z+1000], [x,0,z+1000], tint);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, reference);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(referenceGeometry), gl.STATIC_DRAW);
+  }
+  let tileClock = 0, noticeClock = -1, waitingSince = null;
+  function updateStreamingNotice(seconds, snapshot, referenceVisible) {
+    if (seconds - noticeClock < .5) return;
+    noticeClock = seconds;
+    const panel = byId('stream-notice');
+    if (!panel) return;
+    const waiting = referenceVisible || snapshot.draw.missingPhotos > 0;
+    if (waiting && waitingSince === null) waitingSince = seconds;
+    if (!waiting) waitingSince = null;
+    const modelPending = !droneRenderer || droneAssetState === 'texturing' || droneAssetState === 'error';
+    panel.hidden = run.mode === 'ready' || (!waiting && !modelPending);
+    const elapsed = waitingSince === null ? 0 : Math.floor(seconds - waitingSince);
+    const progress = '航拍 ' + snapshot.loadedImages + '、高程 ' + snapshot.loadedTerrain +
+      '；載入中 ' + snapshot.inflight + '、排隊 ' + snapshot.pending;
+    byId('stream-message').textContent = waiting
+      ? (referenceVisible ? '地圖尚未顯示；棋盤網格只作方位參考，並非真實海陸。' : '地圖正逐步補齊。') +
+        progress + '（等候 ' + elapsed + ' 秒）。可先操控；慢網絡可能需較長時間。'
+      : '地圖已顯示。';
+    byId('map-retry').hidden = !waiting && droneAssetState !== 'error';
+    byId('model-status').textContent = droneAssetState === 'error'
+      ? '原無人機模型載入失敗，可按重試；飛行仍可操作。'
+      : (!droneRenderer ? '原無人機模型正背景下載（約186 KB），完成後自動顯示。'
+        : droneAssetState === 'texturing' ? '原模型已顯示，機身貼圖載入中。' : '');
+  }
   return (camera, seconds) => {
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(.66,.83,.87,1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (seconds - tileClock > 0.4) {
+    if (run.mode !== 'ready' && seconds - tileClock > 0.4) {
       tiles.requestAround(craft.x, craft.z, camera);
       tileClock = seconds;
       const statusNode = byId('map-status');
@@ -779,7 +921,7 @@ function initializeRenderer() {
     }
     const offline = tiles.status.mode === 'offline';
     if (offline) ensureBakedLandscape();
-    if (!offline && !renderOptions.hideMap) tiles.draw(camera);
+    if (run.mode !== 'ready' && !offline && !renderOptions.hideMap) tiles.draw(camera);
     gl.useProgram(program);
     gl.enableVertexAttribArray(position);
     gl.enableVertexAttribArray(colour);
@@ -788,6 +930,14 @@ function initializeRenderer() {
     gl.uniform3fv(uniforms.upAxis, camera.up);
     gl.uniform3fv(uniforms.forwardAxis, camera.forward);
     gl.uniform2f(uniforms.lens, camera.fx, camera.fy);
+    const snapshot = tiles.progressSnapshot();
+    const referenceVisible = run.mode !== 'ready' && !(offline && bakedReady) && (offline || snapshot.draw.topTriangles === 0);
+    if (referenceVisible && !renderOptions.hideMap) {
+      updateReferenceGrid();
+      gl.uniform1f(uniforms.photoSurface, 0);
+      draw(reference, referenceGeometry.length);
+    }
+    updateStreamingNotice(seconds, snapshot, referenceVisible);
     if (bakedReady && offline && !renderOptions.hideMap) {
       // Tile/drone draws also use texture units 0/1; never depend on a
       // previous async atlas upload leaving those global bindings intact.
@@ -803,9 +953,9 @@ function initializeRenderer() {
     gl.bindBuffer(gl.ARRAY_BUFFER, objects);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geometry), gl.DYNAMIC_DRAW);
     if (!renderOptions.hideObjects) draw(objects, geometry.length);
-    if (droneRenderer && !renderOptions.hideDrone) droneRenderer.draw(camera);
+    if (droneRenderer && !renderOptions.hideDrone) droneRenderer.draw(camera, seconds);
     lastRenderFrame = {
-      mapVisible: !renderOptions.hideMap, offlineLandscape: offline && bakedReady && !renderOptions.hideMap,
+      referenceVisible, mapVisible: !renderOptions.hideMap, offlineLandscape: offline && bakedReady && !renderOptions.hideMap,
       objectsDrawn: !renderOptions.hideObjects, droneDrawn: !!droneRenderer && !renderOptions.hideDrone,
       objectVertices: renderOptions.hideObjects ? 0 : geometry.length / 6,
       eye: camera.eye.slice(), forward: camera.forward.slice()
@@ -847,15 +997,17 @@ function createLandscape() {
   // Build from the original elevation grid so narrow coves and ridges keep their samples.
   function gridRow(row) {
     const z = (106.85 - row * .3) * 111;
-    return Array.from({ length: 801 }, (_, column) => {
-      const x = (column * .15 - 46.7) * 103;
-      return [x,bakedElevation(x,z) ?? 0,z];
+    const columns = LOW_POWER ? 200 : 800;
+    return Array.from({ length: columns + 1 }, (_, column) => {
+      const x = (column * (120 / columns) - 46.7) * 103;
+      return [x,(bakedElevation(x,z) || 0),z];
     });
   }
   let north = gridRow(0);
-  for (let row = .5; row <= 490; row += .5) {
+  const rowStep = LOW_POWER ? 2 : .5;
+  for (let row = rowStep; row <= 490; row += rowStep) {
     const south = gridRow(row);
-    for (let column = 0; column < 800; column++) {
+    for (let column = 0; column < north.length - 1; column++) {
       const nw = north[column], ne = north[column + 1];
       const sw = south[column], se = south[column + 1];
       if (nw[1] || ne[1] || sw[1]) landFace(nw, ne, sw);
@@ -1046,12 +1198,13 @@ try {
   let previous = performance.now();
   function frame(now) {
     try {
-      const scale = Math.min(devicePixelRatio || 1,1.6);
+      const scale = Math.min(devicePixelRatio || 1, LOW_POWER ? 1 : 1.6);
       const width = Math.max(1,Math.round(canvas.clientWidth*scale));
       const height = Math.max(1,Math.round(canvas.clientHeight*scale));
       if (canvas.width!==width || canvas.height!==height) {
         canvas.width=width; canvas.height=height;
       }
+      if (contextLost) { previous = now; requestAnimationFrame(frame); return; }
       update(clamp((now-previous)/1000,0,.05));
       previous = now;
       const camera = cameraView();
@@ -1070,7 +1223,7 @@ try {
   requestAnimationFrame(frame);
 } catch (error) {
   console.error(error);
-  const stage = !gl ? 'webgl-context' : (typeof HK === 'undefined' ? 'hk-map-script' : (!window.DRONE_MODEL ? 'drone-model-script' : 'initializeRenderer'));
+  const stage = !gl ? 'webgl-context' : (typeof HK === 'undefined' ? 'hk-map-script' : 'initializeRenderer');
   showInitFailure(stage, error);
 }
 

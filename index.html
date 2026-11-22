@@ -5,11 +5,42 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Cache-Control" content="no-store">
 <title>長洲飛行隊｜香港巡航</title>
-<link rel="stylesheet" href="style.css?v=r11-20261122-1100">
+<link rel="stylesheet" href="style.css?v=r12-20261122-1155">
 <script>
-window.GAME_BUILD = 'r11-20261122-1100';
+window.GAME_BUILD = 'r12-20261122-1155';
 window.GAME_DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 if (!window.GAME_DEBUG) document.documentElement.classList.add('release');
+// ES5 bootstrap remains executable even if a later game script fails to parse.
+(function () {
+  var q = location.search;
+  var mobile = !!((window.matchMedia && window.matchMedia('(pointer:coarse)').matches) ||
+    (navigator.maxTouchPoints > 0 && window.innerWidth < 1100) || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent));
+  window.GAME_LOW_POWER = /(?:[?&])quality=low(?:&|$)/.test(q) ||
+    (mobile && !/(?:[?&])quality=high(?:&|$)/.test(q));
+  window.__startupInfo = { stage: 'scripts', message: '正在載入程式；地圖不會阻住開始', ready: false };
+  window.__startup = function (stage, message, ready) {
+    window.__startupInfo = { stage: stage, message: String(message || ''), ready: !!ready, lowPower: window.GAME_LOW_POWER };
+    var status = document.getElementById('startup-status');
+    if (status) status.textContent = '版本 ' + window.GAME_BUILD + ' · ' + window.__startupInfo.message;
+    var retry = document.getElementById('startup-retry');
+    if (retry) retry.hidden = !!ready;
+  };
+  document.addEventListener('DOMContentLoaded', function () {
+    var state = window.__startupInfo;
+    window.__startup(state.stage, state.message, state.ready);
+  });
+  window.addEventListener('error', function (event) {
+    var target = event.target;
+    if (target && target.dataset && target.dataset.optional === '1') return;
+    if (target && target.tagName === 'SCRIPT') window.__startup('script-error', '程式檔載入失敗，請用下面相容模式重載', false);
+    else if (event.message) window.__startup('script-error', event.message, false);
+  }, true);
+  setTimeout(function () {
+    if (!window.__startupInfo.ready) window.__startup(window.__startupInfo.stage,
+      '仍未啟動（' + window.__startupInfo.stage + '）。可用相容模式重載；如仍失敗，請提供本列截圖、手機型號及瀏覽器版本', false);
+  }, 12000);
+})();
+
 document.addEventListener('DOMContentLoaded', function() {
   var stamp = document.getElementById('build-id');
   if (stamp && window.GAME_DEBUG) stamp.hidden = false;
@@ -63,12 +94,8 @@ window.addEventListener('unhandledrejection', function(ev) {
   });
 });
 </script>
-<script defer src="terrain.js?v=r11-20261122-1100"></script>
-<script defer src="local-heights.js?v=r11-20261122-1100"></script>
-<script defer src="imagery.js?v=r11-20261122-1100"></script>
-<script defer src="drone-model.js?v=r11-20261122-1100"></script>
-<script defer src="hk-map.js?v=r11-20261122-1100"></script>
-<script defer src="game.js?v=r11-20261122-1100"></script>
+<script defer src="hk-map.js?v=r12-20261122-1155" onload="if(!window.__startupInfo.ready)window.__startup('scripts','核心程式 1/2 已載入；正在載入飛行控制',false)"></script>
+<script defer src="game.js?v=r12-20261122-1155"></script>
 </head>
 <body>
 <main>
@@ -76,7 +103,7 @@ window.addEventListener('unhandledrejection', function(ev) {
 <header>
   <div class="brand">長洲飛行隊 <small>HONG KONG AIR SURVEY</small></div>
   <div class="header-tools">
-    <div id="build-id" title="版本識別" hidden>版本 r11-20261122-1100</div>
+    <div id="build-id" title="版本識別" hidden>版本 r12-20261122-1155</div>
     <label class="place-label">出發點 <select id="place"></select></label>
     <button id="camera" disabled>切換視角 <kbd>C</kbd></button>
   </div>
@@ -98,16 +125,25 @@ window.addEventListener('unhandledrejection', function(ev) {
 <div class="pad"><button data-key="KeyW">前</button><button data-key="KeyA">左</button><button data-key="KeyS">後</button><button data-key="KeyD">右</button></div>
 <div class="pad"><button data-key="Space">升</button><button data-key="ShiftLeft">降</button><button data-key="KeyQ">左轉</button><button data-key="KeyE">右轉</button></div>
 </div>
+<section id="stream-notice" hidden aria-label="地圖載入狀態">
+<span id="stream-message" role="status" aria-live="polite"></span>
+<button id="map-retry" type="button">重試地圖</button>
+<small id="model-status"></small>
+</section>
 <div class="overlay" id="overlay">
 <section class="brief">
 <small>CHEUNG CHAU · HONG KONG</small>
 <h2 id="title">離島巡航</h2>
-<p id="briefing">全程最低離地高度為 200 米，方便觀看航拍地貌。由長洲碼頭出發可進行離島巡航任務；也可選其他出發點自由飛行。全港地圖需網絡載入地政總署航拍圖及公開高程圖磚；圖磚未到也可先開始，失敗時會改用長洲離線地圖並在畫面標示。</p>
-<p id="start-hint" class="controls">任務與自由飛行都從離地 200 米開始，不能再降低。長洲碼頭出發 → 北帝廟 → 北眺亭 → 東灣 → 南氹 → 西灣 → 返回碼頭。限時 10 分鐘；飛入巡查圈，回航在綠圈降至最低離地高度並停定。其他出發點沒有全港任務。</p>
-<p class="controls">電腦可用 WASD 平移、Q / E 轉向、空白鍵升高、Shift 下降。手機請用畫面上的飛行按鈕。</p>
+<p id="startup-status" role="status" aria-live="polite">正在載入程式…</p>
 <div class="brief-actions">
 <button id="start" disabled>載入畫面…</button>
 <button id="explore" class="secondary" disabled>自由飛行</button>
+<a id="startup-retry" href="?v=r12-20261122-1155&amp;quality=low">手機相容模式重載</a>
+</div>
+<div class="brief-content">
+<p id="briefing">全程最低離地高度為 200 米，方便觀看航拍地貌。由長洲碼頭出發可進行離島巡航任務；也可選其他出發點自由飛行。全港地圖需網絡載入地政總署航拍圖及公開高程圖磚；圖磚未到也可先開始，失敗時會改用長洲離線地圖並在畫面標示。</p>
+<p id="start-hint" class="controls">任務與自由飛行都從離地 200 米開始，不能再降低。長洲碼頭出發 → 北帝廟 → 北眺亭 → 東灣 → 南氹 → 西灣 → 返回碼頭。限時 10 分鐘；飛入巡查圈，回航在綠圈降至最低離地高度並停定。其他出發點沒有全港任務。</p>
+<p class="controls">電腦可用 WASD 平移、Q / E 轉向、空白鍵升高、Shift 下降。手機請用畫面上的飛行按鈕。</p>
 </div>
 </section>
 </div>

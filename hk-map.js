@@ -9,6 +9,7 @@
  */
 'use strict';
 const HK = (() => {
+  function hkEntries(entries) { const result = {}; for (const pair of entries) result[pair[0]] = pair[1]; return result; }
   const ORIGIN_LAT = 22.2087121; // Cheung Chau Ferry Pier (OSM node 1611297860)
   const ORIGIN_LON = 114.0283656;
   const M_PER_DEG_LON = 103000;
@@ -157,13 +158,23 @@ const HK = (() => {
   }
 
   function loadImage(url) {
-    return new Promise((resolve, reject) => {
-      const image = new Image();
+    const image = new Image();
+    let rejectLoad;
+    const promise = new Promise((resolve, reject) => {
+      rejectLoad = reject;
       image.crossOrigin = 'anonymous';
       image.onload = () => resolve(image);
       image.onerror = () => reject(new Error('Failed to load ' + url));
       image.src = url;
     });
+    promise.cancel = () => {
+      image.onload = image.onerror = null;
+      image.src = '';
+      const error = new Error('User retried pending map request');
+      error.cancelled = true;
+      rejectLoad(error);
+    };
+    return promise;
   }
 
   function shader(gl, type, source) {
@@ -213,10 +224,16 @@ const HK = (() => {
   }
 
   function createTileManager(gl, elevationFn) {
-    const vary = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT)?.precision
+    const lowPower = typeof window !== 'undefined' && !!window.GAME_LOW_POWER;
+    const maxConcurrent = lowPower ? 2 : MAX_CONCURRENT;
+    const photoLimits = lowPower ? { 15: 16, 17: 12, 18: 0 } : PHOTO_CACHE_LIMITS;
+    const maxTerrainTiles = lowPower ? 24 : 96;
+    const meshBuildBudget = lowPower ? 2 : 8;
+    let builtThisFrame = 0;
+    const vary = (gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT) || {}).precision
       ? 'highp' : 'mediump';
     const program = createProgram(gl, vary);
-    const uniforms = Object.fromEntries(
+    const uniforms = hkEntries(
       ['eye', 'rightAxis', 'upAxis', 'forwardAxis', 'lens', 'photo', 'hasPhoto', 'fallbackColour', 'photoTransform']
         .map(name => [name, gl.getUniformLocation(program, name)])
     );
@@ -228,6 +245,7 @@ const HK = (() => {
     const meshes = new Map();
     const queue = [];
     const queued = new Set();
+    const activeRequests = new Map();
     const query = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
     const layerMode = ['base', 'fine', 'legacy'].includes(query.get('mapLayers')) ? query.get('mapLayers') : 'partition';
     const flatDebug = query.get('mapHeight') === 'flat';
@@ -294,7 +312,7 @@ const HK = (() => {
       }
       // Online surfaces NEVER combine the old atlas/local DTM with Terrarium.
       // Missing DEM is provisional 0 for every LOD, invalidated on every arrival.
-      return sampleTerrarium(lat, lon) ?? 0;
+      return sampleTerrarium(lat, lon) || 0;
     }
 
     function buildMesh(z, x, y) {
@@ -383,12 +401,14 @@ const HK = (() => {
     }
 
     function pump() {
-      while (inflight < MAX_CONCURRENT && queue.length) {
+      while (inflight < maxConcurrent && queue.length) {
         const job = queue.shift();
         inflight++;
         const url = fillTemplate(job.kind === 'terrain' ? TERRAIN_TMPL : IMAGERY_TMPL, job.z, job.x, job.y);
-        loadImage(url).then(image => {
-          if (job.kind === 'image' && job.z > BASE_Z && !retainPhoto(job.z, job.x, job.y)) return;
+        const request = loadImage(url);
+        activeRequests.set(job.key, request);
+        request.then(image => {
+          if (job.kind === 'image' && !retainPhoto(job.z, job.x, job.y)) return;
           if (job.kind === 'terrain') {
             terrains.set(job.key, decodeTerrarium(image));
             loadedTerrain++;
@@ -408,6 +428,7 @@ const HK = (() => {
             status.message = '全港地圖（需網絡）';
           }
         }).catch((error) => {
+          if (error.cancelled) return;
           failed++;
           retryAfter.set(job.key, Date.now() + 30000);
           if (retryAfter.size > 256) retryAfter.delete(retryAfter.keys().next().value);
@@ -422,6 +443,7 @@ const HK = (() => {
           }
         }).finally(() => {
           inflight--;
+          activeRequests.delete(job.key);
           queued.delete(job.key);
           pump();
         });
@@ -429,10 +451,11 @@ const HK = (() => {
     }
 
     function retainPhoto(z, x, y) {
-      if (z === BASE_Z) return true;
+      if (z === BASE_Z && !lowPower) return true;
+      if (z === CLOSE_Z && lowPower) return false;
       const centre = photoCentres.get(z);
       if (!centre || (z >= DETAIL_Z && !localDetailActive)) return false;
-      const keep = z === CLOSE_Z ? 2 : KEEP_RADIUS;
+      const keep = lowPower ? 2 : z === CLOSE_Z ? 2 : KEEP_RADIUS;
       return Math.abs(x - centre.x) <= keep && Math.abs(y - centre.y) <= keep;
     }
 
@@ -446,7 +469,8 @@ const HK = (() => {
         const [, z, x, y] = key.split('/').map(Number);
         if (!retainPhoto(z, x, y)) removePhoto(key);
       }
-      for (const [zoom, limit] of Object.entries(PHOTO_CACHE_LIMITS)) {
+      const limits = lowPower ? { ...photoLimits, 12: 25 } : photoLimits;
+      for (const [zoom, limit] of Object.entries(limits)) {
         const z = +zoom, centre = photoCentres.get(z);
         if (!centre) continue;
         const keys = [...textures.keys()].filter(k => +k.split('/')[1] === z);
@@ -459,12 +483,12 @@ const HK = (() => {
       // Keep a wider DEM halo than photos; never change the height underneath
       // still-visible coarse patches merely because the drone crossed a tile.
       // Bounded cache for long exploratory sessions (96 * 256² * 4 = 24 MiB).
-      if (terrains.size > 96) {
+      if (terrains.size > maxTerrainTiles) {
         for (const key of [...terrains.keys()]) {
           const parts = key.split('/');
           if (Math.abs(+parts[2] - tcx) > KEEP_RADIUS + 2 || Math.abs(+parts[3] - tcy) > KEEP_RADIUS + 2)
             terrains.delete(key);
-          if (terrains.size <= 96) break;
+          if (terrains.size <= maxTerrainTiles) break;
         }
         rebuildAllMeshes();
       }
@@ -475,6 +499,7 @@ const HK = (() => {
       const { lat, lon } = toLonLat(x, z);
       localDetailActive = detailEnabled && inCheungChau(lat, lon);
       const tcx = Math.floor(lon2tile(lon, TERRAIN_Z)), tcy = Math.floor(lat2tile(lat, TERRAIN_Z));
+      photoCentres.set(BASE_Z, { x: Math.floor(lon2tile(lon, BASE_Z)), y: Math.floor(lat2tile(lat, BASE_Z)) });
       photoCentres.set(IMAGE_Z, { x: Math.floor(lon2tile(lon, IMAGE_Z)), y: Math.floor(lat2tile(lat, IMAGE_Z)) });
       // Place the sharp patch ahead of the drone, where a 200 m oblique camera
       // sees the ground, instead of spending all detail behind/below the camera.
@@ -496,8 +521,11 @@ const HK = (() => {
         kind: 'terrain', key: tileKey('ter', TERRAIN_Z, tcx + dx, tcy + dy),
         z: TERRAIN_Z, x: tcx + dx, y: tcy + dy, distance: Math.hypot(dx,dy)
       });
-      const levels = [{ z: IMAGE_Z, radius: localDetailActive ? 1 : LOAD_RADIUS }];
-      if (localDetailActive) levels.push({ z: DETAIL_Z, radius: 2 }, { z: CLOSE_Z, radius: 1 });
+      const levels = [{ z: IMAGE_Z, radius: lowPower || localDetailActive ? 1 : LOAD_RADIUS }];
+      if (localDetailActive) {
+        levels.push({ z: DETAIL_Z, radius: lowPower ? 1 : 2 });
+        if (!lowPower) levels.push({ z: CLOSE_Z, radius: 1 });
+      }
       for (const level of levels) {
         const centre = photoCentres.get(level.z);
         for (let dy = -level.radius; dy <= level.radius; dy++) for (let dx = -level.radius; dx <= level.radius; dx++) {
@@ -506,12 +534,19 @@ const HK = (() => {
           enqueue({ kind: 'image', key: tileKey('img', level.z, px, py), z: level.z, x: px, y: py, distance: Math.hypot(dx,dy) });
         }
       }
-      if (!lastBase) {
-        tilesCovering(WEST, SOUTH, EAST, NORTH, BASE_Z).forEach(t => enqueue({ kind: 'image', key: tileKey('img', t.z, t.x, t.y), ...t }));
+      if (!lastBase || lowPower) {
+        const baseCentre = photoCentres.get(BASE_Z);
+        tilesCovering(WEST, SOUTH, EAST, NORTH, BASE_Z).filter(t => !lowPower ||
+          (Math.abs(t.x-baseCentre.x) <= 1 && Math.abs(t.y-baseCentre.y) <= 1)).forEach(t => enqueue({ kind: 'image', key: tileKey('img', t.z, t.x, t.y), ...t }));
         lastBase = true;
       }
       queue.sort((a,b) => {
-        const priority = t => t.kind === 'terrain' ? 0 : t.z === IMAGE_Z ? 1 : t.z === DETAIL_Z ? 2 : t.z === CLOSE_Z ? 3 : 4;
+        // First two phone requests: centre DEM + centre overview photo, not
+        // NINE sequential DEM downloads before the first photo can even start.
+        const priority = t => t.kind === 'terrain' && t.distance === 0 ? 0
+          : t.z === BASE_Z && t.x === photoCentres.get(BASE_Z).x && t.y === photoCentres.get(BASE_Z).y ? 1
+          : t.kind === 'image' && t.z === IMAGE_Z && t.distance === 0 ? 2
+          : t.kind === 'terrain' ? 3 : t.z === IMAGE_Z ? 4 : t.z === BASE_Z ? 5 : t.z === DETAIL_Z ? 6 : 7;
         return priority(a)-priority(b) || (a.distance || 0)-(b.distance || 0);
       });
       evict(tcx, tcy);
@@ -529,11 +564,20 @@ const HK = (() => {
       gl.enableVertexAttribArray(aPos);
       gl.enableVertexAttribArray(aUv);
       const plan = surfaceTiles();
+      const pending = plan.filter(t => !meshes.has(tileKey('mesh', t.z, t.x, t.y))).sort((a,b) => {
+        const distance = t => { const box = tileBoundsXZ(t.z,t.x,t.y); return Math.hypot((box.minX+box.maxX)/2-camera.eye[0],(box.minZ+box.maxZ)/2-camera.eye[2]); };
+        return distance(a)-distance(b);
+      });
+      builtThisFrame = 0;
+      for (const t of pending.slice(0, meshBuildBudget)) {
+        meshes.set(tileKey('mesh', t.z, t.x, t.y), buildMesh(t.z,t.x,t.y));
+        builtThisFrame++;
+      }
       lastDrawStats = { patches: plan.length, topTriangles: 0, skirtTriangles: 0, missingPhotos: 0 };
       for (const t of plan) {
         const { z, x, y, photo } = t;
         const key = tileKey('mesh', z, x, y);
-        if (!meshes.has(key)) meshes.set(key, buildMesh(z, x, y));
+        if (!meshes.has(key)) continue;
         const mesh = meshes.get(key);
         const texKey = tileKey('img', photo.z, photo.x, photo.y);
         const scale = 2 ** (photo.z - z);
@@ -601,10 +645,12 @@ const HK = (() => {
     function debugSnapshot() {
       return {
         layerMode, flatDebug, hideSkirts, detailEnabled, localDetailActive,
-        cacheByZoom: Object.fromEntries([BASE_Z, IMAGE_Z, DETAIL_Z, CLOSE_Z].map(z => [z, [...textures.keys()].filter(k => +k.split('/')[1] === z).length])),
+        lowPower, maxConcurrent, meshBuildBudget, builtThisFrame, maxTerrainTiles,
+        pendingMeshCount: surfaceTiles().length - meshes.size,
+        cacheByZoom: hkEntries([BASE_Z, IMAGE_Z, DETAIL_Z, CLOSE_Z].map(z => [z, [...textures.keys()].filter(k => +k.split('/')[1] === z).length])),
         estimatedPhotoBytes: textures.size * 256 * 256 * 8,
         geometryBytes: [...meshes.values()].reduce((sum, m) => sum + m.byteLength, 0),
-        cacheLimits: { ...PHOTO_CACHE_LIMITS },
+        cacheLimits: { ...photoLimits },
         lastDrawStats: { ...lastDrawStats },
         terrainRevision, loadedImages, loadedTerrain,
         pending: queue.length, inflight, failed, meshCount: meshes.size,
@@ -612,7 +658,23 @@ const HK = (() => {
         meshRevisions: [...meshes.values()].map(m => m.revision)
       };
     }
-    return { requestAround, draw, terrainElevation, paintMinimap, status, bounds, setHeightMode, getHeightMode, rebuildAllMeshes, debugSnapshot };
+    function retry() {
+      retryAfter.clear();
+      failed = 0;
+      status.failed = 0;
+      status.mode = loadedImages ? 'online' : 'loading';
+      status.message = '正在重試全港圖磚；已完成圖磚會保留';
+      // Explicit user retry can restart a stalled request. Abort its Image
+      // before releasing ownership; finally() frees the same concurrency slot.
+      for (const request of activeRequests.values()) request.cancel();
+      planDirty = true;
+      pump();
+    }
+    function progressSnapshot() {
+      return { loadedImages, loadedTerrain, inflight, pending: queue.length,
+        draw: { ...lastDrawStats }, mode: status.mode };
+    }
+    return { retry, progressSnapshot, requestAround, draw, terrainElevation, paintMinimap, status, bounds, setHeightMode, getHeightMode, rebuildAllMeshes, debugSnapshot };
   }
 
   const heightDebug = { mode: 'auto' };
