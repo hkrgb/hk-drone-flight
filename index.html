@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Cache-Control" content="no-store">
 <title>長洲飛行隊｜香港巡航</title>
-<link rel="stylesheet" href="style.css?v=r10-20261122-0110">
+<link rel="stylesheet" href="style.css?v=r11-20261122-1100">
 <script>
-window.GAME_BUILD = 'r10-20261122-0110';
+window.GAME_BUILD = 'r11-20261122-1100';
 window.GAME_DEBUG = /(?:^|[?&])debug=1(?:&|$)/.test(location.search);
 if (!window.GAME_DEBUG) document.documentElement.classList.add('release');
 document.addEventListener('DOMContentLoaded', function() {
@@ -63,12 +63,12 @@ window.addEventListener('unhandledrejection', function(ev) {
   });
 });
 </script>
-<script defer src="terrain.js?v=r10-20261122-0110"></script>
-<script defer src="local-heights.js?v=r10-20261122-0110"></script>
-<script defer src="imagery.js?v=r10-20261122-0110"></script>
-<script defer src="drone-model.js?v=r10-20261122-0110"></script>
-<script defer src="hk-map.js?v=r10-20261122-0110"></script>
-<script defer src="game.js?v=r10-20261122-0110"></script>
+<script defer src="terrain.js?v=r11-20261122-1100"></script>
+<script defer src="local-heights.js?v=r11-20261122-1100"></script>
+<script defer src="imagery.js?v=r11-20261122-1100"></script>
+<script defer src="drone-model.js?v=r11-20261122-1100"></script>
+<script defer src="hk-map.js?v=r11-20261122-1100"></script>
+<script defer src="game.js?v=r11-20261122-1100"></script>
 </head>
 <body>
 <main>
@@ -76,7 +76,7 @@ window.addEventListener('unhandledrejection', function(ev) {
 <header>
   <div class="brand">長洲飛行隊 <small>HONG KONG AIR SURVEY</small></div>
   <div class="header-tools">
-    <div id="build-id" title="版本識別" hidden>版本 r10-20261122-0110</div>
+    <div id="build-id" title="版本識別" hidden>版本 r11-20261122-1100</div>
     <label class="place-label">出發點 <select id="place"></select></label>
     <button id="camera" disabled>切換視角 <kbd>C</kbd></button>
   </div>
@@ -103,7 +103,7 @@ window.addEventListener('unhandledrejection', function(ev) {
 <small>CHEUNG CHAU · HONG KONG</small>
 <h2 id="title">離島巡航</h2>
 <p id="briefing">全程最低離地高度為 200 米，方便觀看航拍地貌。由長洲碼頭出發可進行離島巡航任務；也可選其他出發點自由飛行。全港地圖需網絡載入地政總署航拍圖及公開高程圖磚；圖磚未到也可先開始，失敗時會改用長洲離線地圖並在畫面標示。</p>
-<p id="start-hint" class="controls">任務與自由飛行都從離地 200 米開始，不能再降低。長洲任務改為飛入巡查圈，回航時在綠圈降至最低離地高度並停定。其他出發點沒有全港任務。</p>
+<p id="start-hint" class="controls">任務與自由飛行都從離地 200 米開始，不能再降低。長洲碼頭出發 → 北帝廟 → 北眺亭 → 東灣 → 南氹 → 西灣 → 返回碼頭。限時 10 分鐘；飛入巡查圈，回航在綠圈降至最低離地高度並停定。其他出發點沒有全港任務。</p>
 <p class="controls">電腦可用 WASD 平移、Q / E 轉向、空白鍵升高、Shift 下降。手機請用畫面上的飛行按鈕。</p>
 <div class="brief-actions">
 <button id="start" disabled>載入畫面…</button>
@@ -118,7 +118,7 @@ Aerial Photograph from Lands Department　航拍影像 © 香港特別行政區�
 全港高程：<a href="https://registry.opendata.aws/terrain-tiles/">Mapzen Terrain Tiles</a>（香港地區為 SRTM／GMTED，courtesy of the U.S. Geological Survey；<a href="https://github.com/tilezen/joerd/blob/master/docs/attribution.md">完整來源</a>）　長洲精細高程：<a href="https://data.gov.hk/en-data/dataset/hk-landsd-openmap-5m-grid-dtm">地政總署 5 米 DTM</a><br>
 無人機模型：<a href="https://sketchfab.com/3d-models/non-military-consumer-uav-drone-7558fc3a77d4412dad2a02d9d7c3fbb7">non-military consumer UAV drone</a> by FamousUnityHubSoldier，Sketchfab Standard License
 </div>
-</footer>
+ · 任務地點 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></footer>
 </main>
 </body>
 </html>

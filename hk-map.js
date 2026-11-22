@@ -44,7 +44,18 @@ const HK = (() => {
   const LANDSD_LOGO = 'https://www.landsd.gov.hk/images/landsd_logo.svg';
   const BASE_Z = 12;
   const TERRAIN_Z = 13;
-  const IMAGE_Z = 15;
+  const IMAGE_Z = 15; // unchanged elsewhere in Hong Kong
+  const DETAIL_Z = 17, CLOSE_Z = 18;
+  // Only Cheung Chau and its immediate coast receive additional photo LODs.
+  const CHEUNG_CHAU = { west: 114.014, east: 114.039, south: 22.195, north: 22.225 };
+  const PHOTO_CACHE_LIMITS = { 15: 49, 17: 32, 18: 16 };
+  function inCheungChau(lat, lon) {
+    return lon >= CHEUNG_CHAU.west && lon <= CHEUNG_CHAU.east && lat >= CHEUNG_CHAU.south && lat <= CHEUNG_CHAU.north;
+  }
+  function touchesCheungChau(z, x, y) {
+    return tile2lon(x + 1, z) >= CHEUNG_CHAU.west && tile2lon(x, z) <= CHEUNG_CHAU.east
+      && tile2lat(y + 1, z) <= CHEUNG_CHAU.north && tile2lat(y, z) >= CHEUNG_CHAU.south;
+  }
   const GRID = 33;
   const LOAD_RADIUS = 2;
   const KEEP_RADIUS = 3;
@@ -98,31 +109,31 @@ const HK = (() => {
     const fine = available.filter(t => t.z === IMAGE_Z);
     if (mode === 'base') return bases.map(t => ({ ...t, photo: t }));
     if (mode === 'fine') return fine.map(t => ({ ...t, photo: t }));
-    // Diagnostic only: reproduce r8's overlapping ownership, not the default.
-    if (mode === 'legacy') return [...bases, ...fine].map(t => ({ ...t, photo: t }));
-    const fineKeys = new Set(fine.map(t => `${t.x}/${t.y}`));
+    if (mode === 'legacy') return available.map(t => ({ ...t, photo: t }));
+    const key = (z, x, y) => `${z}/${x}/${y}`;
+    const photos = new Map(available.map(t => [key(t.z, t.x, t.y), t]));
     const ancestors = new Set();
-    for (const t of fine) {
-      for (let z = BASE_Z; z < IMAGE_Z; z++) {
-        const scale = 2 ** (IMAGE_Z - z);
-        ancestors.add(`${z}/${Math.floor(t.x / scale)}/${Math.floor(t.y / scale)}`);
-      }
+    for (const t of available) for (let z = BASE_Z; z < t.z; z++) {
+      const scale = 2 ** (t.z - z);
+      ancestors.add(key(z, Math.floor(t.x / scale), Math.floor(t.y / scale)));
     }
     const result = [];
-    function visit(z, x, y, photo) {
-      if (z === IMAGE_Z && fineKeys.has(`${x}/${y}`)) {
-        result.push({ z, x, y, photo: { z, x, y } });
-      } else if (ancestors.has(`${z}/${x}/${y}`)) {
+    function visit(z, x, y, inherited) {
+      const k = key(z, x, y), photo = photos.get(k) || inherited;
+      if (ancestors.has(k)) {
         for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++)
           visit(z + 1, x * 2 + dx, y * 2 + dy, photo);
-      } else result.push({ z, x, y, photo });
+      } else if (photo) result.push({ z, x, y, photo });
     }
-    const baseKeys = new Set(bases.map(t => `${t.x}/${t.y}`));
-    for (const t of bases) visit(t.z, t.x, t.y, t);
-    for (const t of fine) {
-      const scale = 2 ** (IMAGE_Z - BASE_Z);
-      if (!baseKeys.has(`${Math.floor(t.x / scale)}/${Math.floor(t.y / scale)}`))
-        result.push({ ...t, photo: t });
+    // Start only at photos with no loaded ancestor: also works while the
+    // overview has not arrived, or a parent request fails. Never overlap roots.
+    for (const t of available) {
+      let hasParent = false;
+      for (let z = t.z - 1; z >= BASE_Z; z--) {
+        const scale = 2 ** (t.z - z);
+        if (photos.has(key(z, Math.floor(t.x / scale), Math.floor(t.y / scale)))) { hasParent = true; break; }
+      }
+      if (!hasParent) visit(t.z, t.x, t.y, null);
     }
     return result;
   }
@@ -221,6 +232,11 @@ const HK = (() => {
     const layerMode = ['base', 'fine', 'legacy'].includes(query.get('mapLayers')) ? query.get('mapLayers') : 'partition';
     const flatDebug = query.get('mapHeight') === 'flat';
     const hideSkirts = query.get('hideSkirts') === '1';
+    const detailEnabled = query.get('detail') !== 'off';
+    let localDetailActive = false;
+    let craftPosition = { x: 0, z: 0 };
+    const photoCentres = new Map();
+    const retryAfter = new Map();
     let lastDrawStats = { patches: 0, topTriangles: 0, skirtTriangles: 0, missingPhotos: 0 };
     let surfacePlan = [], planDirty = true, terrainRevision = 0;
     let inflight = 0, failed = 0, loadedImages = 0, loadedTerrain = 0, lastBase = false;
@@ -282,11 +298,12 @@ const HK = (() => {
     }
 
     function buildMesh(z, x, y) {
+      const grid = z >= DETAIL_Z ? 9 : z > IMAGE_Z ? 17 : GRID;
       const positions = [], uvs = [], indices = [];
-      for (let r = 0; r < GRID; r++) {
-        const vt = r / (GRID - 1);
-        for (let c = 0; c < GRID; c++) {
-          const ut = c / (GRID - 1);
+      for (let r = 0; r < grid; r++) {
+        const vt = r / (grid - 1);
+        for (let c = 0; c < grid; c++) {
+          const ut = c / (grid - 1);
           const lon = tile2lon(x + ut, z);
           const lat = tile2lat(y + vt, z);
           const p = toXZ(lat, lon);
@@ -298,10 +315,10 @@ const HK = (() => {
           uvs.push(ut, vt);
         }
       }
-      for (let r = 0; r < GRID - 1; r++) {
-        for (let c = 0; c < GRID - 1; c++) {
-          const i = r * GRID + c;
-          indices.push(i, i + 1, i + GRID, i + 1, i + GRID + 1, i + GRID);
+      for (let r = 0; r < grid - 1; r++) {
+        for (let c = 0; c < grid - 1; c++) {
+          const i = r * grid + c;
+          indices.push(i, i + 1, i + grid, i + 1, i + grid + 1, i + grid);
         }
       }
       const topCount = indices.length;
@@ -310,9 +327,9 @@ const HK = (() => {
       // unlike the old coarse layer they cannot cover a town/hill interior.
       if (layerMode !== 'legacy') {
         const edges = [[], [], [], []];
-        for (let i = 0; i < GRID; i++) {
-          edges[0].push(i); edges[1].push(i * GRID + GRID - 1);
-          edges[2].push((GRID - 1) * GRID + i); edges[3].push(i * GRID);
+        for (let i = 0; i < grid; i++) {
+          edges[0].push(i); edges[1].push(i * grid + grid - 1);
+          edges[2].push((grid - 1) * grid + i); edges[3].push(i * grid);
         }
         for (const edge of edges) for (let j = 0; j < edge.length - 1; j++) {
           const a = edge[j], b = edge[j+1], lo = positions.length / 3;
@@ -335,7 +352,7 @@ const HK = (() => {
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
       gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STATIC_DRAW);
-      return { buffer, count: indices.length, topCount, revision: terrainRevision };
+      return { buffer, count: indices.length, topCount, byteLength: packed.byteLength, revision: terrainRevision };
     }
 
     function surfaceTiles() {
@@ -360,7 +377,7 @@ const HK = (() => {
     }
 
     function enqueue(job) {
-      if (queued.has(job.key) || images.has(job.key) || terrains.has(job.key)) return;
+      if (queued.has(job.key) || images.has(job.key) || terrains.has(job.key) || (retryAfter.get(job.key) || 0) > Date.now()) return;
       queued.add(job.key);
       queue.push(job);
     }
@@ -371,6 +388,7 @@ const HK = (() => {
         inflight++;
         const url = fillTemplate(job.kind === 'terrain' ? TERRAIN_TMPL : IMAGERY_TMPL, job.z, job.x, job.y);
         loadImage(url).then(image => {
+          if (job.kind === 'image' && job.z > BASE_Z && !retainPhoto(job.z, job.x, job.y)) return;
           if (job.kind === 'terrain') {
             terrains.set(job.key, decodeTerrarium(image));
             loadedTerrain++;
@@ -380,6 +398,8 @@ const HK = (() => {
           } else {
             rememberImage(job.key, image);
             loadedImages++;
+            const own = toLonLat(craftPosition.x, craftPosition.z);
+            evict(Math.floor(lon2tile(own.lon, TERRAIN_Z)), Math.floor(lat2tile(own.lat, TERRAIN_Z)));
 
           }
           status.failed = failed;
@@ -389,6 +409,8 @@ const HK = (() => {
           }
         }).catch((error) => {
           failed++;
+          retryAfter.set(job.key, Date.now() + 30000);
+          if (retryAfter.size > 256) retryAfter.delete(retryAfter.keys().next().value);
           status.failed = failed;
           if (loadedImages + loadedTerrain === 0 && (failed >= 3 || status.mode === 'offline')) {
             status.mode = 'offline';
@@ -406,16 +428,33 @@ const HK = (() => {
       }
     }
 
-    function evict(tcx, tcy, icx, icy) {
+    function retainPhoto(z, x, y) {
+      if (z === BASE_Z) return true;
+      const centre = photoCentres.get(z);
+      if (!centre || (z >= DETAIL_Z && !localDetailActive)) return false;
+      const keep = z === CLOSE_Z ? 2 : KEEP_RADIUS;
+      return Math.abs(x - centre.x) <= keep && Math.abs(y - centre.y) <= keep;
+    }
+
+    function removePhoto(key) {
+      gl.deleteTexture(textures.get(key));
+      textures.delete(key); images.delete(key); planDirty = true;
+    }
+
+    function evict(tcx, tcy) {
       for (const key of [...textures.keys()]) {
-        const parts = key.split('/');
-        const z = +parts[1], x = +parts[2], y = +parts[3];
-        if (z !== BASE_Z && z === IMAGE_Z && (Math.abs(x - icx) > KEEP_RADIUS || Math.abs(y - icy) > KEEP_RADIUS)) {
-          gl.deleteTexture(textures.get(key));
-          textures.delete(key);
-          images.delete(key);
-          planDirty = true;
-        }
+        const [, z, x, y] = key.split('/').map(Number);
+        if (!retainPhoto(z, x, y)) removePhoto(key);
+      }
+      for (const [zoom, limit] of Object.entries(PHOTO_CACHE_LIMITS)) {
+        const z = +zoom, centre = photoCentres.get(z);
+        if (!centre) continue;
+        const keys = [...textures.keys()].filter(k => +k.split('/')[1] === z);
+        keys.sort((a,b) => {
+          const [, , ax, ay] = a.split('/').map(Number), [, , bx, by] = b.split('/').map(Number);
+          return Math.hypot(bx-centre.x,by-centre.y) - Math.hypot(ax-centre.x,ay-centre.y);
+        });
+        while (keys.length > limit) removePhoto(keys.shift());
       }
       // Keep a wider DEM halo than photos; never change the height underneath
       // still-visible coarse patches merely because the drone crossed a tile.
@@ -431,43 +470,52 @@ const HK = (() => {
       }
     }
 
-    function requestAround(x, z) {
+    function requestAround(x, z, camera) {
+      craftPosition = { x, z };
       const { lat, lon } = toLonLat(x, z);
-      const tcx = Math.floor(lon2tile(lon, TERRAIN_Z));
-      const tcy = Math.floor(lat2tile(lat, TERRAIN_Z));
-      const icx = Math.floor(lon2tile(lon, IMAGE_Z));
-      const icy = Math.floor(lat2tile(lat, IMAGE_Z));
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          enqueue({
-            kind: 'terrain',
-            key: tileKey('ter', TERRAIN_Z, tcx + dx, tcy + dy),
-            z: TERRAIN_Z, x: tcx + dx, y: tcy + dy
-          });
-        }
+      localDetailActive = detailEnabled && inCheungChau(lat, lon);
+      const tcx = Math.floor(lon2tile(lon, TERRAIN_Z)), tcy = Math.floor(lat2tile(lat, TERRAIN_Z));
+      photoCentres.set(IMAGE_Z, { x: Math.floor(lon2tile(lon, IMAGE_Z)), y: Math.floor(lat2tile(lat, IMAGE_Z)) });
+      // Place the sharp patch ahead of the drone, where a 200 m oblique camera
+      // sees the ground, instead of spending all detail behind/below the camera.
+      const look = camera && camera.forward;
+      const focus = toLonLat(x + (look ? look[0] * 350 : 0), z + (look ? look[2] * 350 : 0));
+      for (const zoom of [DETAIL_Z, CLOSE_Z]) photoCentres.set(zoom, {
+        x: Math.floor(lon2tile(focus.lon, zoom)), y: Math.floor(lat2tile(focus.lat, zoom))
+      });
+      // Drop queued requests from places the player has already left. At most
+      // MAX_CONCURRENT old requests can finish, and their photos are discarded.
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const job = queue[i];
+        const needed = job.kind === 'terrain'
+          ? Math.abs(job.x-tcx) <= 1 && Math.abs(job.y-tcy) <= 1
+          : retainPhoto(job.z, job.x, job.y);
+        if (!needed) { queued.delete(job.key); queue.splice(i,1); }
       }
-      for (let dy = -LOAD_RADIUS; dy <= LOAD_RADIUS; dy++) {
-        for (let dx = -LOAD_RADIUS; dx <= LOAD_RADIUS; dx++) {
-          enqueue({
-            kind: 'image',
-            key: tileKey('img', IMAGE_Z, icx + dx, icy + dy),
-            z: IMAGE_Z, x: icx + dx, y: icy + dy
-          });
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) enqueue({
+        kind: 'terrain', key: tileKey('ter', TERRAIN_Z, tcx + dx, tcy + dy),
+        z: TERRAIN_Z, x: tcx + dx, y: tcy + dy, distance: Math.hypot(dx,dy)
+      });
+      const levels = [{ z: IMAGE_Z, radius: localDetailActive ? 1 : LOAD_RADIUS }];
+      if (localDetailActive) levels.push({ z: DETAIL_Z, radius: 2 }, { z: CLOSE_Z, radius: 1 });
+      for (const level of levels) {
+        const centre = photoCentres.get(level.z);
+        for (let dy = -level.radius; dy <= level.radius; dy++) for (let dx = -level.radius; dx <= level.radius; dx++) {
+          const px = centre.x + dx, py = centre.y + dy;
+          if (level.z >= DETAIL_Z && !touchesCheungChau(level.z, px, py)) continue;
+          enqueue({ kind: 'image', key: tileKey('img', level.z, px, py), z: level.z, x: px, y: py, distance: Math.hypot(dx,dy) });
         }
       }
       if (!lastBase) {
-        tilesCovering(WEST, SOUTH, EAST, NORTH, BASE_Z).forEach(t => {
-          enqueue({ kind: 'image', key: tileKey('img', t.z, t.x, t.y), ...t });
-        });
+        tilesCovering(WEST, SOUTH, EAST, NORTH, BASE_Z).forEach(t => enqueue({ kind: 'image', key: tileKey('img', t.z, t.x, t.y), ...t }));
         lastBase = true;
       }
-      // Near DEM/photos first, not the whole-HK overview ahead of the drone.
-      queue.sort((a, b) => {
-        const priority = t => t.kind === 'terrain' ? 0 : t.z === IMAGE_Z ? 1 : 2;
-        return priority(a) - priority(b);
+      queue.sort((a,b) => {
+        const priority = t => t.kind === 'terrain' ? 0 : t.z === IMAGE_Z ? 1 : t.z === DETAIL_Z ? 2 : t.z === CLOSE_Z ? 3 : 4;
+        return priority(a)-priority(b) || (a.distance || 0)-(b.distance || 0);
       });
+      evict(tcx, tcy);
       pump();
-      evict(tcx, tcy, icx, icy);
     }
 
     function draw(camera) {
@@ -538,7 +586,7 @@ const HK = (() => {
       const layers = [...images.entries()].map(([key, image]) => {
         const parts = key.split('/');
         return { image, kind: parts[0], z: +parts[1], x: +parts[2], y: +parts[3] };
-      }).filter(t => t.kind === 'img' && (t.z === BASE_Z || t.z === IMAGE_Z))
+      }).filter(t => t.kind === 'img' && t.z >= BASE_Z)
         .sort((a, b) => a.z - b.z);
       for (const t of layers) {
         const b = tileBoundsXZ(t.z, t.x, t.y);
@@ -552,7 +600,12 @@ const HK = (() => {
 
     function debugSnapshot() {
       return {
-        layerMode, flatDebug, hideSkirts, lastDrawStats: { ...lastDrawStats },
+        layerMode, flatDebug, hideSkirts, detailEnabled, localDetailActive,
+        cacheByZoom: Object.fromEntries([BASE_Z, IMAGE_Z, DETAIL_Z, CLOSE_Z].map(z => [z, [...textures.keys()].filter(k => +k.split('/')[1] === z).length])),
+        estimatedPhotoBytes: textures.size * 256 * 256 * 8,
+        geometryBytes: [...meshes.values()].reduce((sum, m) => sum + m.byteLength, 0),
+        cacheLimits: { ...PHOTO_CACHE_LIMITS },
+        lastDrawStats: { ...lastDrawStats },
         terrainRevision, loadedImages, loadedTerrain,
         pending: queue.length, inflight, failed, meshCount: meshes.size,
         surface: surfaceTiles().map(t => ({ ...t, photo: { ...t.photo } })),
@@ -574,6 +627,6 @@ const HK = (() => {
     LANDSD_LOGO, IMAGERY_TMPL, TERRAIN_TMPL, heightDebug,
     toXZ, toLonLat, lon2tile, lat2tile, tile2lon, tile2lat,
     tilesCovering, tileKey, tileBoundsXZ, planSurfaceTiles, createTileManager,
-    WEST, EAST, SOUTH, NORTH, BASE_Z, TERRAIN_Z, IMAGE_Z
+    WEST, EAST, SOUTH, NORTH, BASE_Z, TERRAIN_Z, IMAGE_Z, DETAIL_Z, CLOSE_Z, CHEUNG_CHAU, inCheungChau, PHOTO_CACHE_LIMITS
   };
 })();

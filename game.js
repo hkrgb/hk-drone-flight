@@ -1,6 +1,6 @@
 'use strict';
 
-const GAME_BUILD = window.GAME_BUILD || 'r10-20261122-0110';
+const GAME_BUILD = window.GAME_BUILD || 'r11-20261122-1100';
 // Diagnostic switches are explicit and independent of map loading/flight logic.
 // showDock restores the obsolete synthetic platform ONLY for identification.
 const renderQuery = new URLSearchParams(location.search);
@@ -67,13 +67,23 @@ const canvas = byId('world');
 const gl = canvas.getContext('webgl', { antialias: true });
 const map = byId('map').getContext('2d');
 const start = byId('start');
+// Named OSM objects cross-checked against LandsD's Cheung Chau GeoPDF.
+// Nam Tam is the actual locality, NOT Po Toi's identically named bay.
+const MISSION_TIME_LIMIT = 600;
 const route = [
-  { name: '長洲碼頭', x: 0, y: 200, z: 0 },
-  { name: '避風塘上空', x: -440, y: 260, z: 160 },
-  { name: '北岸水域', x: -360, y: 280, z: 820 },
-  { name: '東灣外海', x: 700, y: 250, z: 100 },
-  { name: '長洲碼頭回航', x: 0, y: 200, z: 0 }
-];
+  { name: '長洲碼頭（出發）', lat: HK.ORIGIN_LAT, lon: HK.ORIGIN_LON, source: 'https://www.openstreetmap.org/node/1611297860' },
+  { name: '北帝廟', lat: 22.2124008, lon: 114.0279217, source: 'https://www.openstreetmap.org/way/204534877' },
+  { name: '北眺亭', lat: 22.2170690, lon: 114.0305558, source: 'https://www.openstreetmap.org/node/2145321541' },
+  { name: '東灣', lat: 22.2118374, lon: 114.0323076, source: 'https://www.openstreetmap.org/node/1134027637' },
+  { name: '南氹', lat: 22.2031516, lon: 114.0317132, source: 'https://www.openstreetmap.org/node/3239128609' },
+  { name: '西灣', lat: 22.2017057, lon: 114.0205274, source: 'https://www.openstreetmap.org/node/1134027670' },
+  { name: '長洲碼頭（終點）', lat: HK.ORIGIN_LAT, lon: HK.ORIGIN_LON, source: 'https://www.openstreetmap.org/node/1611297860' }
+].map(point => ({ ...point, ...HK.toXZ(point.lat, point.lon), y: 200 }));
+const LAST_ROUTE_INDEX = route.length - 1;
+function missionTarget(index = run.next) {
+  const point = route[index];
+  return { ...point, y: Math.max(point.y, terrainFloor(point.x, point.z)) };
+}
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 const bearing = (a, b) => Math.atan2(b.x - a.x, b.z - a.z);
@@ -198,8 +208,7 @@ function startFlight(explore = false) {
   // Already at 200 m AGL, so skip the old 15 m takeoff gate.
   Object.assign(run, { mode: 'flying', next: free ? 0 : 1, time: 0, camera: false, explore: free });
   placeCraft(place, free);
-  keys.clear();
-  pointers.clear();
+  clearFlightInput();
   byId('overlay').hidden = true;
   byId('camera').disabled = false;
   start.blur();
@@ -210,11 +219,12 @@ function startFlight(explore = false) {
 
 function finish(success) {
   run.mode = 'ended';
+  clearFlightInput();
   byId('overlay').hidden = false;
   byId('camera').disabled = true;
   byId('title').textContent = success ? '巡航完成' : '巡航中斷';
   byId('briefing').textContent = success
-    ? '已完成三個巡查點並安全降落。飛行時間 ' + Math.ceil(run.time) + ' 秒。'
+    ? '已完成北帝廟、北眺亭、東灣、南氹、西灣巡查並返回碼頭。飛行時間 ' + Math.ceil(run.time) + ' 秒。'
     : '電量耗盡。你可以由長洲碼頭再試一次。';
   start.textContent = '再飛一次';
   start.focus();
@@ -223,7 +233,7 @@ function finish(success) {
 function update(dt) {
   if (run.mode !== 'flying') return;
   run.time += dt;
-  if (!run.explore && run.time >= 240) return finish(false);
+  if (!run.explore && run.time >= MISSION_TIME_LIMIT) return finish(false);
   const axis = (positive, negative) => Number(active(positive)) - Number(active(negative));
   craft.yaw += axis('KeyE', 'KeyQ') * dt * 1.7;
   const forward = axis('KeyW', 'KeyS');
@@ -244,9 +254,9 @@ function update(dt) {
 
   if (!run.explore) {
     if (run.next === 0) run.next = 1;
-    const target = route[run.next];
-    if (run.next >= 1 && run.next <= 3 && Math.hypot(craft.x - target.x, craft.z - target.z) <= 70) run.next++;
-    if (run.next === 4 && Math.hypot(craft.x, craft.z) <= 40 &&
+    const target = missionTarget();
+    if (run.next >= 1 && run.next < LAST_ROUTE_INDEX && Math.hypot(craft.x - target.x, craft.z - target.z) <= 70) run.next++;
+    if (run.next === LAST_ROUTE_INDEX && Math.hypot(craft.x, craft.z) <= 40 &&
         altitudeAgl(craft.x, craft.y, craft.z) <= MIN_AGL + 15 &&
         Math.hypot(craft.vx, craft.vz) < 4) finish(true);
   }
@@ -264,7 +274,7 @@ byId('place')?.addEventListener('change', () => {
     startFlight(true);
   } else if (byId('start-hint')) {
     byId('start-hint').textContent = place.mission
-      ? '由長洲碼頭起飛可進行原本的離島巡航任務。選其他地點則進入自由飛行，沒有全港任務。'
+      ? '由長洲碼頭起飛可進行七站長洲巡航任務。選其他地點則進入自由飛行，沒有全港任務。'
       : '將從「' + place.name + '」進入自由飛行。長洲巡航任務只在長洲碼頭出發。';
   }
 });
@@ -274,6 +284,7 @@ byId('camera').addEventListener('click', event => {
 });
 const flightKeys = new Set([...buttons.map(button => button.dataset.key), 'ShiftRight']);
 window.addEventListener('keydown', event => {
+  if (event.target.closest('select,input,textarea,[contenteditable]')) return;
   if (event.code === 'KeyR' && run.mode !== 'ready' && !event.repeat && !start.disabled) startFlight(run.explore);
   if (run.mode !== 'flying') return;
   if (event.code === 'KeyC' && !event.repeat) toggleCamera();
@@ -282,19 +293,43 @@ window.addEventListener('keydown', event => {
   keys.add(event.code);
 });
 window.addEventListener('keyup', event => keys.delete(event.code));
-window.addEventListener('blur', () => {
+function clearFlightInput() {
   keys.clear();
   pointers.clear();
-});
+  for (const button of buttons) button.classList.remove('pressed');
+}
+function releaseFlightPointer(event) {
+  pointers.delete(event.pointerId);
+  for (const button of buttons) {
+    if (![...pointers.values()].includes(button.dataset.key)) button.classList.remove('pressed');
+  }
+}
+window.addEventListener('blur', clearFlightInput);
+document.addEventListener('visibilitychange', () => { if (document.hidden) clearFlightInput(); });
+// Global release is a fallback if pointer capture is lost or unsupported.
+window.addEventListener('pointerup', releaseFlightPointer);
+window.addEventListener('pointercancel', releaseFlightPointer);
 for (const button of buttons) {
+  const stopNativeGesture = event => { if (event.cancelable) event.preventDefault(); };
+  // Scope cancellation to flight controls, NEVER the whole page or <select>.
+  for (const type of ['contextmenu', 'selectstart', 'dragstart', 'touchstart', 'touchmove', 'touchend', 'touchcancel']) {
+    button.addEventListener(type, stopNativeGesture, { passive: false });
+  }
   button.addEventListener('pointerdown', event => {
-    if (run.mode !== 'flying') return;
-    event.preventDefault();
-    button.setPointerCapture(event.pointerId);
+    stopNativeGesture(event);
+    if (run.mode !== 'flying' || (event.pointerType === 'mouse' && event.button !== 0)) return;
     pointers.set(event.pointerId, button.dataset.key);
-  });
-  for (const eventName of ['pointerup', 'pointercancel', 'lostpointercapture']) {
-    button.addEventListener(eventName, event => pointers.delete(event.pointerId));
+    button.classList.add('pressed');
+    try { button.setPointerCapture(event.pointerId); } catch (_) { /* global release still clears this pointer */ }
+  }, { passive: false });
+  button.addEventListener('pointermove', event => {
+    if (pointers.has(event.pointerId)) stopNativeGesture(event);
+  }, { passive: false });
+  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    button.addEventListener(type, event => {
+      stopNativeGesture(event);
+      releaseFlightPointer(event);
+    }, { passive: false });
   }
 }
 
@@ -653,6 +688,7 @@ function initializeRenderer() {
   window.renderDebug = () => ({
     options: { ...renderOptions }, objects: { ...lastObjectCounts },
     frame: { ...lastRenderFrame }, craft: { ...craft },
+    mission: { timeLimit: MISSION_TIME_LIMIT, next: run.next, route: route.map(p => ({ ...p })) },
     map: tiles.debugSnapshot()
   });
   tiles.requestAround(craft.x, craft.z);
@@ -736,7 +772,7 @@ function initializeRenderer() {
     gl.clearColor(.66,.83,.87,1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     if (seconds - tileClock > 0.4) {
-      tiles.requestAround(craft.x, craft.z);
+      tiles.requestAround(craft.x, craft.z, camera);
       tileClock = seconds;
       const statusNode = byId('map-status');
       if (statusNode) statusNode.textContent = tiles.status.message;
@@ -842,8 +878,8 @@ function createObjects(seconds) {
       renderOptions.objectTint ? [1,1,0] : [.77,.78,.63]);
   }
   const dockVertices = out.length / 6;
-  const target = route[run.next];
-  const returning = run.next === 0 || run.next === 4;
+  const target = missionTarget();
+  const returning = run.next === 0 || run.next === LAST_ROUTE_INDEX;
   const angleToDrone = bearing(target,craft);
   const radius = returning ? 24 : 52;
   const centreY = Math.max(target.y, terrainFloor(target.x, target.z));
@@ -911,8 +947,8 @@ function drawMap() {
     route.forEach((point,index) => map[index ? 'lineTo' : 'moveTo'](...plot(point.x,point.z)));
     map.stroke();
     map.setLineDash([]);
-    route.slice(0,4).forEach((point,index) => {
-      map.fillStyle = index===run.next || (index===0 && run.next===4) ? '#ffca6c' : '#b3e9c6';
+    route.slice(0,-1).forEach((point,index) => {
+      map.fillStyle = index===run.next || (index===0 && run.next===LAST_ROUTE_INDEX) ? '#ffca6c' : '#b3e9c6';
       map.beginPath();
       map.arc(...plot(point.x,point.z),3,0,Math.PI*2);
       map.fill();
@@ -959,7 +995,7 @@ function cameraView() {
 
 let hudTime = -Infinity;
 function drawHud(camera, seconds) {
-  const target = route[run.next];
+  const target = missionTarget();
   const marker = byId('marker');
   const flying = run.mode === 'flying';
   marker.hidden = !flying || run.explore || run.next===0;
@@ -987,7 +1023,7 @@ function drawHud(camera, seconds) {
     byId('guide').textContent = '鄰近：' + nearest.name + ' · 長洲任務僅在碼頭出發';
   } else {
     byId('target').textContent = target.name;
-    byId('guide').textContent = run.next===4 ?
+    byId('guide').textContent = run.next===LAST_ROUTE_INDEX ?
       '飛入綠圈，降至最低離地高度（200 米）並停定' :
       '飛向黃圈 · 目標海拔 ' + target.y + ' 米';
   }
@@ -995,7 +1031,7 @@ function drawHud(camera, seconds) {
   if (byId('agl')) byId('agl').textContent = Math.max(0, Math.round(altitudeAgl(craft.x, craft.y, craft.z)));
   byId('speed').textContent = Math.round(Math.hypot(craft.vx,craft.vz)*3.6);
   byId('heading').textContent = String((Math.round(craft.yaw*180/Math.PI)%360+360)%360).padStart(3,'0');
-  byId('battery').textContent = run.explore ? '—' : Math.max(0,100-Math.floor(run.time/2.4));
+  byId('battery').textContent = run.explore ? '—' : Math.max(0,100-Math.floor(run.time / MISSION_TIME_LIMIT * 100));
   items.forEach((li,index) => {
     li.classList.toggle('current',index===run.next);
     li.classList.toggle('done',index<run.next);

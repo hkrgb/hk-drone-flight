@@ -32,3 +32,8 @@ body:has(#overlay:not([hidden])) footer{display:flex;left:max(10px,env(safe-area
 @media(pointer:coarse),(max-width:720px){
   .height-mode-label{font-size:10px}
 }
+
+/* Only flying controls suppress iOS text selection/callouts. Native dropdowns stay native. */
+.touch,.pad,.pad button,.pad button *{user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;-webkit-user-drag:none;touch-action:none}
+.pad button{ -webkit-tap-highlight-color:transparent }
+.pad button.pressed{background:#3b727b}
